@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import math
 import time
 from datetime import datetime
 from glob import glob
@@ -427,7 +428,10 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
             "(SELECT s2.session_id FROM sessions s2 WHERE " + " AND ".join(subconds) + ")"
         )
 
-    fts_params.append(limit)
+    # Over-fetch candidates so recency re-ranking can surface recent results
+    # that pure BM25 might have ranked just outside the cutoff.
+    candidate_limit = limit * 3
+    fts_params.append(candidate_limit)
 
     # First find best-ranking session_ids.
     # FTS5's rank column is auto-populated with bm25 when using ORDER BY rank.
@@ -448,6 +452,7 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
         return []
 
     results = []
+    now_ms = time.time() * 1000
     for session_id, rank in ranked:
         # Get session metadata
         meta = conn.execute(
@@ -464,9 +469,23 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
         ).fetchone()
         excerpt = snippet_row[0] if snippet_row else ""
 
-        results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, rank))
+        # Apply recency bias: blend BM25 score with a time-decay boost.
+        # BM25 rank is negative (more negative = better match).
+        # Recency boost: 1.0 for today, decaying with a half-life of 30 days.
+        timestamp = meta[4]
+        if timestamp:
+            age_days = max((now_ms - timestamp) / 86_400_000, 0)
+            recency_boost = math.exp(-0.693 * age_days / 30)  # half-life = 30 days
+        else:
+            recency_boost = 0.0
+        # Blend: 80% BM25, 20% recency. Recency term scales with typical BM25 magnitude.
+        blended_rank = rank * (1 - 0.2 * recency_boost)
 
-    return results
+        results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, blended_rank))
+
+    # Re-sort by blended rank and trim to requested limit.
+    results.sort(key=lambda r: r[7])
+    return results[:limit]
 
 
 def format_timestamp(ts_ms):

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Add slight recency bias to search ranking
+- Blend BM25 relevance with time-decay boost (half-life: 30 days, 20% weight)
+- Over-fetch 3x candidates before re-ranking to avoid cutting off recent results
+
 ## 0.2.1
 
 - Batch message inserts with `executemany`

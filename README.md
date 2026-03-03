@@ -12,10 +12,26 @@ Then use `/recall` in Claude Code (or Codex) or ask "find a past session where w
 
 ## How it works
 
-- Indexes user/assistant messages from both `~/.claude/projects/**/*.jsonl` (Claude Code) and `~/.codex/sessions/` (Codex) into a SQLite FTS5 database at `~/.recall.db`
+```
+  ~/.claude/projects/**/*.jsonl ──┐
+                                  ├─▶ Index ──▶ ~/.recall.db (SQLite FTS5)
+  ~/.codex/sessions/**/*.jsonl ──┘       │
+                                         │  incremental (mtime-based)
+                                         │
+  Query ──▶ FTS5 Match ──▶ BM25 rank ──▶ Recency boost ──▶ Results
+                │                          half-life: 30 days
+                │  Porter stemming
+                │  phrase/boolean/prefix
+                ▼
+         snippet extraction
+         highlighted excerpts
+```
+
+- Indexes user/assistant messages into a SQLite FTS5 database at `~/.recall.db`
 - First run indexes all sessions (a few seconds); subsequent runs only process new/modified files
 - Skips tool_use, tool_result, thinking, and image blocks
-- Returns results ranked by BM25 with highlighted excerpts, tagged `[claude]` or `[codex]`
+- Results ranked by BM25 with a slight recency bias (recent sessions get up to a 20% boost, decaying with a 30-day half-life)
+- Results tagged `[claude]` or `[codex]` with highlighted excerpts
 - No dependencies — Python 3.9+ stdlib only (sqlite3, json, argparse)
 
 ## Contributing

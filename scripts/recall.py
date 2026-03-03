@@ -8,7 +8,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from glob import glob
 from pathlib import Path
 
@@ -60,25 +60,24 @@ def migrate_db_location():
                 old_extra.rename(Path(str(DB_PATH) + suffix))
 
 
+TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
+
+
 def extract_text(content):
-    """Extract plain text from message content (string or array format)."""
+    """Extract plain text from message content (string or array format).
+
+    Accepts "text" (Claude), "input_text" and "output_text" (Codex) block types.
+    Skips tool calls, tool results, thinking blocks, and images.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type", "")
-            # Skip non-text block types
-            if btype in ("tool_result", "tool_use", "thinking", "image"):
-                continue
-            # Accept text from both Claude ("text") and Codex ("input_text", "output_text") formats
-            if btype in ("text", "input_text", "output_text"):
-                text = block.get("text", "")
-                if text:
-                    parts.append(text)
-        return "\n".join(parts)
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type", "") in TEXT_BLOCK_TYPES
+        ]
+        return "\n".join(filter(None, parts))
     return ""
 
 

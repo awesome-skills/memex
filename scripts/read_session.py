@@ -4,67 +4,9 @@
 import json
 import sys
 
+TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 
-def print_claude_session(path):
-    """Print a Claude Code JSONL session."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            etype = entry.get("type", "")
-            role = entry.get("role", "")
-            if role not in ("user", "assistant"):
-                if etype in ("user", "human"):
-                    role = "user"
-                elif etype == "assistant":
-                    role = "assistant"
-                else:
-                    continue
-
-            content = entry.get("message", {})
-            if isinstance(content, dict):
-                content = content.get("content", "")
-            elif not isinstance(content, str):
-                content = entry.get("content", "")
-
-            text = extract_text(content)
-            if text:
-                print(f"--- {role} ---")
-                print(text[:500])
-                print()
-
-
-def print_codex_session(path):
-    """Print a Codex JSONL session."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if entry.get("record_type") == "state":
-                continue
-
-            role = entry.get("role", "")
-            if role not in ("user", "assistant"):
-                continue
-
-            text = extract_text(entry.get("content", ""))
-
-            if text and "<user_instructions>" not in text and "<environment_context>" not in text:
-                print(f"--- {role} ---")
-                print(text[:500])
-                print()
+SKIP_MARKERS = ("<user_instructions>", "<environment_context>")
 
 
 def extract_text(content):
@@ -72,19 +14,59 @@ def extract_text(content):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type", "")
-            if btype in ("tool_result", "tool_use", "thinking", "image"):
-                continue
-            if btype in ("text", "input_text", "output_text"):
-                text = block.get("text", "")
-                if text:
-                    parts.append(text)
-        return "\n".join(parts)
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type", "") in TEXT_BLOCK_TYPES
+        ]
+        return "\n".join(filter(None, parts))
     return ""
+
+
+def iter_messages(path):
+    """Yield (role, text) pairs from a session file, auto-detecting format."""
+    fmt = detect_format(path)
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Skip Codex state snapshots
+            if entry.get("record_type") == "state":
+                continue
+
+            # Resolve role
+            role = entry.get("role", "")
+            if role not in ("user", "assistant"):
+                etype = entry.get("type", "")
+                if etype in ("user", "human"):
+                    role = "user"
+                elif etype == "assistant":
+                    role = "assistant"
+                else:
+                    continue
+
+            # Extract text — Claude wraps in entry.message.content, Codex uses entry.content
+            if fmt == "claude":
+                content = entry.get("message", {})
+                if isinstance(content, dict):
+                    content = content.get("content", "")
+                elif not isinstance(content, str):
+                    content = entry.get("content", "")
+            else:
+                content = entry.get("content", "")
+
+            text = extract_text(content)
+            if not text or any(marker in text for marker in SKIP_MARKERS):
+                continue
+
+            yield role, text
 
 
 def detect_format(path):
@@ -98,30 +80,30 @@ def detect_format(path):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # Codex files have record_type or top-level id+instructions
             if entry.get("record_type") == "state":
                 return "codex"
-            # Claude Code entries have parentUuid or message.role
             if "parentUuid" in entry or "message" in entry:
                 return "claude"
-            # Codex first entry has id + instructions
             if "id" in entry and "instructions" in entry:
                 return "codex"
     return "claude"
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <session.jsonl>", file=sys.stderr)
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description="Pretty-print a Claude Code or Codex session transcript")
+    parser.add_argument("path", help="Path to a session .jsonl file")
+    parser.add_argument("--pretty", action="store_true", help="Human-readable output instead of JSON")
+    args = parser.parse_args()
 
-    path = sys.argv[1]
-    fmt = detect_format(path)
-
-    if fmt == "codex":
-        print_codex_session(path)
+    if args.pretty:
+        for role, text in iter_messages(args.path):
+            print(f"--- {role} ---")
+            print(text[:500])
+            print()
     else:
-        print_claude_session(path)
+        msgs = [{"role": role, "text": text} for role, text in iter_messages(args.path)]
+        print(json.dumps(msgs, indent=2))
 
 
 if __name__ == "__main__":

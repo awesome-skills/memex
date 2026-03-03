@@ -8,6 +8,8 @@
 - New `--source claude|codex` flag to filter by tool
 - DB moved from `~/.claude/recall.db` to `~/.recall.db` (auto-migrated on first run)
 - Schema migration adds `source` column to existing databases
+- New `read_session.py` script for reading transcripts (auto-detects format, JSON by default, `--pretty` for human-readable)
+- Concise `extract_text` using list comprehension and `TEXT_BLOCK_TYPES` set
 
 ## 0.1.0
 

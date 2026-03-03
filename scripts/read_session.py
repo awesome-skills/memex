@@ -6,7 +6,10 @@ import sys
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 
-SKIP_MARKERS = ("<user_instructions>", "<environment_context>")
+SKIP_MARKERS = (
+    "<user_instructions>", "<environment_context>",
+    "<permissions instructions>", "# AGENTS.md instructions",
+)
 
 
 def extract_text(content):
@@ -37,30 +40,46 @@ def iter_messages(path):
             except json.JSONDecodeError:
                 continue
 
-            # Skip Codex state snapshots
+            # Skip Codex state snapshots (legacy)
             if entry.get("record_type") == "state":
                 continue
 
-            # Resolve role
-            role = entry.get("role", "")
-            if role not in ("user", "assistant"):
-                etype = entry.get("type", "")
-                if etype in ("user", "human"):
-                    role = "user"
-                elif etype == "assistant":
-                    role = "assistant"
-                else:
-                    continue
-
-            # Extract text — Claude wraps in entry.message.content, Codex uses entry.content
             if fmt == "claude":
+                # Resolve role from type or role fields
+                role = entry.get("role", "")
+                if role not in ("user", "assistant"):
+                    etype = entry.get("type", "")
+                    if etype in ("user", "human"):
+                        role = "user"
+                    elif etype == "assistant":
+                        role = "assistant"
+                    else:
+                        continue
+
+                # Claude wraps in entry.message.content
                 content = entry.get("message", {})
                 if isinstance(content, dict):
                     content = content.get("content", "")
                 elif not isinstance(content, str):
                     content = entry.get("content", "")
+
             else:
-                content = entry.get("content", "")
+                # Codex — handle both legacy and current (wrapped payload) formats
+                etype = entry.get("type", "")
+
+                if etype in ("session_meta", "event_msg", "turn_context"):
+                    continue
+
+                if etype == "response_item":
+                    payload = entry.get("payload", {})
+                    role = payload.get("role", "")
+                    content = payload.get("content", "")
+                else:
+                    role = entry.get("role", "")
+                    content = entry.get("content", "")
+
+                if role not in ("user", "assistant"):
+                    continue
 
             text = extract_text(content)
             if not text or any(marker in text for marker in SKIP_MARKERS):
@@ -85,6 +104,9 @@ def detect_format(path):
             if "parentUuid" in entry or "message" in entry:
                 return "claude"
             if "id" in entry and "instructions" in entry:
+                return "codex"
+            # Current Codex format uses type: "session_meta"
+            if entry.get("type") == "session_meta":
                 return "codex"
     return "claude"
 

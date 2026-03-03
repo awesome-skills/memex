@@ -7,9 +7,15 @@
 - Results tagged with `[claude]` or `[codex]` to show origin
 - New `--source claude|codex` flag to filter by tool
 - DB moved from `~/.claude/recall.db` to `~/.recall.db` (auto-migrated on first run)
-- Schema migration adds `source` column to existing databases
+- Schema migration adds `source` and `file_path` columns to existing databases
+- Results now show full `File:` path — works with subagent sessions nested in subdirectories
 - New `read_session.py` script for reading transcripts (auto-detects format, JSON by default, `--pretty` for human-readable)
 - Concise `extract_text` using list comprehension and `TEXT_BLOCK_TYPES` set
+
+### Backward compatibility
+- DB auto-migrated from `~/.claude/recall.db` to `~/.recall.db` on first run
+- `source` column defaults to `"claude"` for existing rows
+- `file_path` column defaults to `""` for existing rows (run `--reindex` to backfill)
 
 ## 0.1.0
 

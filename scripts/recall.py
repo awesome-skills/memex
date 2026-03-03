@@ -24,6 +24,7 @@ def create_schema(conn):
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
             source TEXT,
+            file_path TEXT,
             project TEXT,
             slug TEXT,
             timestamp INTEGER,
@@ -40,11 +41,16 @@ def create_schema(conn):
 
 
 def migrate_schema(conn):
-    """Add source column if upgrading from an older schema."""
+    """Add columns if upgrading from an older schema."""
     try:
         conn.execute("SELECT source FROM sessions LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'claude'")
+        conn.commit()
+    try:
+        conn.execute("SELECT file_path FROM sessions LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
         conn.commit()
 
 
@@ -61,6 +67,7 @@ def migrate_db_location():
 
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
+CODEX_SKIP_MARKERS = ("<user_instructions>", "<environment_context>", "<permissions instructions>", "# AGENTS.md instructions")
 
 
 def extract_text(content):
@@ -171,6 +178,7 @@ def parse_claude_session(path):
     metadata = {
         "session_id": session_id,
         "source": "claude",
+        "file_path": path,
         "project": project or "",
         "slug": slug,
         "timestamp": earliest_ts or 0,
@@ -184,8 +192,9 @@ def parse_codex_session(path):
     """Parse a Codex JSONL session file, returning (metadata, messages).
 
     Codex sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl.
-    Entries use OpenAI's Responses API format with {type: "message", role, content}.
-    State snapshots ({record_type: "state"}) and instruction blocks are skipped.
+    Supports two formats:
+      - Legacy: flat entries with {role, content, record_type, id, ...}
+      - Current: wrapped entries with {timestamp, type, payload: {role, content, ...}}
     """
     session_id = Path(path).stem
     project = None
@@ -214,24 +223,50 @@ def parse_codex_session(path):
                 except json.JSONDecodeError:
                     continue
 
-                # Skip state snapshots
+                # Skip state snapshots (legacy format)
                 if entry.get("record_type") == "state":
                     continue
 
-                # First entry may carry session-level metadata (id, timestamp, instructions)
-                if not earliest_ts and "timestamp" in entry and "id" in entry:
-                    ts_ms = parse_iso_timestamp(entry["timestamp"])
-                    if ts_ms:
+                # Parse timestamp (present in both formats at top level)
+                ts_raw = entry.get("timestamp")
+                if ts_raw:
+                    ts_ms = parse_iso_timestamp(ts_raw)
+                    if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
                         earliest_ts = ts_ms
-                    # Prefer the entry's id over the filename
-                    entry_id = entry.get("id", "")
+
+                etype = entry.get("type", "")
+
+                # Current format: {type: "session_meta", payload: {id, cwd, ...}}
+                if etype == "session_meta":
+                    payload = entry.get("payload", {})
+                    entry_id = payload.get("id", "")
                     if entry_id and session_id.startswith("rollout-"):
                         session_id = entry_id
+                    if not project:
+                        project = payload.get("cwd", "")
+                    continue
 
-                # Extract cwd from <environment_context> blocks
-                if not project:
-                    content = entry.get("content", [])
-                    if isinstance(content, list):
+                # Current format: {type: "response_item", payload: {role, content, ...}}
+                # Legacy format: {role, content, ...} (no type or type="message")
+                if etype == "response_item":
+                    payload = entry.get("payload", {})
+                    role = payload.get("role", "")
+                    content = payload.get("content", "")
+                elif etype in ("event_msg", "turn_context"):
+                    continue
+                else:
+                    # Legacy format — session metadata in first entry
+                    if not project and "id" in entry and "instructions" in entry:
+                        entry_id = entry.get("id", "")
+                        if entry_id and session_id.startswith("rollout-"):
+                            session_id = entry_id
+                        continue
+
+                    role = entry.get("role", "")
+                    content = entry.get("content", "")
+
+                    # Legacy: extract cwd from <environment_context> blocks
+                    if not project and isinstance(content, list):
                         for block in content:
                             if isinstance(block, dict):
                                 text = block.get("text", "")
@@ -242,30 +277,19 @@ def parse_codex_session(path):
                                     if cwd_match:
                                         project = cwd_match.group(1).strip()
 
-                # Parse timestamp
-                ts_raw = entry.get("timestamp")
-                if ts_raw:
-                    ts_ms = parse_iso_timestamp(ts_raw)
-                    if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
-                        earliest_ts = ts_ms
-
-                # Determine role
-                role = entry.get("role", "")
+                # Only index user and assistant messages (skip developer/system)
                 if role not in ("user", "assistant"):
                     continue
 
-                # Extract text content (Codex uses content directly, not wrapped in message)
-                content = entry.get("content", "")
                 text = extract_text(content)
 
                 # Skip system/instruction blocks injected as user messages
-                if text and "<user_instructions>" in text:
+                if not text:
                     continue
-                if text and "<environment_context>" in text:
+                if any(marker in text for marker in CODEX_SKIP_MARKERS):
                     continue
 
-                if text:
-                    messages.append((role, text))
+                messages.append((role, text))
 
     except (OSError, PermissionError) as e:
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
@@ -278,6 +302,7 @@ def parse_codex_session(path):
     metadata = {
         "session_id": session_id,
         "source": "codex",
+        "file_path": path,
         "project": project or "",
         "slug": slug,
         "timestamp": earliest_ts or 0,
@@ -295,11 +320,11 @@ def index_sessions(conn, force=False):
             DELETE FROM messages;
         """)
 
-    # Get existing mtimes
+    # Get existing mtimes keyed by file_path (stable across session_id changes)
     existing = {}
     try:
-        for row in conn.execute("SELECT session_id, mtime FROM sessions"):
-            existing[row[0]] = row[1]
+        for row in conn.execute("SELECT file_path, session_id, mtime FROM sessions"):
+            existing[row[0]] = (row[1], row[2])
     except sqlite3.OperationalError:
         pass
 
@@ -320,20 +345,20 @@ def index_sessions(conn, force=False):
     skipped = 0
 
     for fpath, source in sources:
-        fname = Path(fpath).stem
         try:
             mtime = os.path.getmtime(fpath)
         except OSError:
             continue
 
-        if not force and fname in existing and existing[fname] == mtime:
+        if not force and fpath in existing and existing[fpath][1] == mtime:
             skipped += 1
             continue
 
-        # Remove old data for this session if re-indexing
-        if fname in existing:
-            conn.execute("DELETE FROM sessions WHERE session_id = ?", (fname,))
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (fname,))
+        # Remove old data for this file if re-indexing
+        if fpath in existing:
+            old_sid = existing[fpath][0]
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (old_sid,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (old_sid,))
 
         if source == "claude":
             result = parse_claude_session(fpath)
@@ -346,9 +371,9 @@ def index_sessions(conn, force=False):
         metadata, messages = result
 
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, source, project, slug, timestamp, mtime) VALUES (?, ?, ?, ?, ?, ?)",
-            (metadata["session_id"], metadata["source"], metadata["project"],
-             metadata["slug"], metadata["timestamp"], mtime),
+            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (metadata["session_id"], metadata["source"], metadata["file_path"],
+             metadata["project"], metadata["slug"], metadata["timestamp"], mtime),
         )
 
         for role, text in messages:
@@ -418,7 +443,7 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
     for session_id, rank in ranked:
         # Get session metadata
         meta = conn.execute(
-            "SELECT source, project, slug, timestamp FROM sessions WHERE session_id = ?",
+            "SELECT source, file_path, project, slug, timestamp FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if not meta:
@@ -431,7 +456,7 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
         ).fetchone()
         excerpt = snippet_row[0] if snippet_row else ""
 
-        results.append((session_id, meta[0], meta[1], meta[2], meta[3], excerpt, rank))
+        results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, rank))
 
     return results
 
@@ -482,7 +507,7 @@ def main():
 
     print(f"Found {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
 
-    for i, (session_id, source, project, slug, timestamp, excerpt, rank) in enumerate(results, 1):
+    for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank) in enumerate(results, 1):
         date = format_timestamp(timestamp)
         src_tag = f"[{source}]" if source else ""
         proj_name = Path(project).name if project else "unknown"
@@ -490,6 +515,8 @@ def main():
         if project:
             print(f"    {project}")
         print(f"    ID: {session_id}")
+        if file_path:
+            print(f"    File: {file_path}")
         if excerpt:
             # Clean up excerpt for display
             excerpt_clean = excerpt.replace("\n", " ").strip()

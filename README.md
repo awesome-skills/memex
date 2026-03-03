@@ -1,6 +1,6 @@
 # recall
 
-Ever lost a conversation session with claude code and wish your could resume it? This skill lets claude search across all your past conversations with full-text search. Builds a SQLite FTS5 index over `~/.claude/projects/` JSONL files with BM25 ranking, Porter stemming, and incremental updates.
+Ever lost a conversation session with claude code and wish you could resume it? This skill lets claude search across all your past conversations with full-text search. Builds a SQLite FTS5 index over `~/.claude/projects/` JSONL files with BM25 ranking, Porter stemming, and incremental updates.
 
 ## Install
 

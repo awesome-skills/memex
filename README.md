@@ -1,42 +1,14 @@
 # recall
 
-Search past Claude Code sessions with full-text search. Builds a SQLite FTS5 index over `~/.claude/projects/` JSONL files with BM25 ranking, Porter stemming, and incremental updates.
+Ever lost a conversation session with claude code and wish your could resume it? This skill lets claude search across all your past conversations with full-text search. Builds a SQLite FTS5 index over `~/.claude/projects/` JSONL files with BM25 ranking, Porter stemming, and incremental updates.
 
 ## Install
 
 ```bash
-npx @anthropic-ai/claude-code skills add arjunkmrm/recall
+npx skills add arjunkmrm/recall
 ```
 
-Then use `/recall` in Claude Code or ask "find a past session about X".
-
-## Usage
-
-```bash
-python3 ~/.claude/skills/recall/scripts/recall.py QUERY [--project PATH] [--days N] [--limit N] [--reindex]
-```
-
-### Examples
-
-```bash
-# Keyword search
-python3 ~/.claude/skills/recall/scripts/recall.py "bufferStore"
-
-# Phrase search
-python3 ~/.claude/skills/recall/scripts/recall.py '"ACP protocol"'
-
-# Boolean
-python3 ~/.claude/skills/recall/scripts/recall.py "rust AND async"
-
-# Prefix
-python3 ~/.claude/skills/recall/scripts/recall.py "buffer*"
-
-# Filter by project and recency
-python3 ~/.claude/skills/recall/scripts/recall.py "state machine" --project ~/my-project --days 7
-
-# Force reindex
-python3 ~/.claude/skills/recall/scripts/recall.py --reindex "test"
-```
+Then use `/recall` in Claude Code or ask "find a past session where we talked about foo" (you might need to restart claude code).
 
 ## How it works
 

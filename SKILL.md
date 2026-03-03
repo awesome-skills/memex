@@ -1,4 +1,5 @@
 ---
+name: recall
 description: >
   Search past Claude Code sessions. Triggers: /recall, "search old conversations",
   "find a past session", "recall a previous conversation", "search session history",

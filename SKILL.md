@@ -17,7 +17,7 @@ Search all past Claude Code and Codex sessions using full-text search with BM25 
 ## Usage
 
 ```bash
-python3 <RECALL_SKILL_DIR>/scripts/recall.py [QUERY] [--list] [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex]
+python3 <RECALL_SKILL_DIR>/scripts/recall.py [QUERY] [--list] [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex] [--json]
 ```
 
 `<RECALL_SKILL_DIR>` varies by installation. Common examples:
@@ -56,6 +56,9 @@ python3 <RECALL_SKILL_DIR>/scripts/recall.py --list --limit 20
 
 # List mode with optional text filter
 python3 <RECALL_SKILL_DIR>/scripts/recall.py --list "state machine" --limit 20
+
+# Machine-readable JSON output
+python3 <RECALL_SKILL_DIR>/scripts/recall.py --json --source codex --list "auth api"
 ```
 
 ## Query Syntax (FTS5)
@@ -92,8 +95,10 @@ If results are missing `File:` paths, run `--reindex` to backfill.
 
 - Index is stored at `~/.recall.db` (SQLite FTS5, auto-migrated from `~/.claude/recall.db`)
 - Indexes both `~/.claude/projects/` (Claude Code) and `~/.codex/sessions/` (Codex)
+- `--project` matches an exact project path or child paths only
 - First run indexes all sessions (a few seconds); subsequent runs are incremental
 - Automatically prunes orphaned DB rows when indexed source files are removed
 - Only user and assistant messages are indexed (tool calls, thinking blocks, state snapshots skipped)
 - Results show `[claude]` or `[codex]` tags to indicate the source
 - For simple CJK queries, adds substring fallback matching to improve recall
+- Claude subagent transcript hits are marked with their parent session ID in text output

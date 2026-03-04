@@ -13,6 +13,10 @@ from datetime import datetime
 from glob import glob
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 from recall_common import SKIP_MARKERS, extract_text
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -72,6 +76,7 @@ def migrate_db_location():
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 CJK_SEGMENT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 FTS_SPECIAL_QUERY_RE = re.compile(r'["*():]|(^|\s)(AND|OR|NOT)(\s|$)', re.IGNORECASE)
+CLAUDE_SUBAGENT_RE = re.compile(r"/([^/]+)/subagents/agent-[^/]+\.jsonl$")
 LIKE_ESCAPE = "\\"
 
 def escape_like(value):
@@ -81,6 +86,31 @@ def escape_like(value):
         .replace("%", LIKE_ESCAPE + "%")
         .replace("_", LIKE_ESCAPE + "_")
     )
+
+
+def subagent_parent_session_id(file_path):
+    """Return parent session ID for Claude subagent transcript paths."""
+    match = CLAUDE_SUBAGENT_RE.search(file_path or "")
+    return match.group(1) if match else None
+
+
+def result_to_dict(row):
+    """Convert an internal result tuple to a serializable dict."""
+    session_id, source, file_path, project, slug, timestamp, excerpt, rank = row
+    parent_session_id = subagent_parent_session_id(file_path)
+    return {
+        "session_id": session_id,
+        "source": source,
+        "file_path": file_path,
+        "project": project,
+        "slug": slug,
+        "timestamp": timestamp,
+        "date": format_timestamp(timestamp),
+        "excerpt": make_excerpt(excerpt) if excerpt else "",
+        "rank": rank,
+        "is_subagent": bool(parent_session_id),
+        "parent_session_id": parent_session_id,
+    }
 
 
 def parse_iso_timestamp(ts_str):
@@ -386,7 +416,6 @@ def prune_orphan_sessions(conn):
 
     conn.executemany("DELETE FROM sessions WHERE session_id = ?", to_delete)
     conn.executemany("DELETE FROM messages WHERE session_id = ?", to_delete)
-    conn.commit()
     return len(to_delete)
 
 
@@ -480,13 +509,10 @@ def index_sessions(conn, force=False):
 
         indexed += 1
 
-    conn.commit()
-
     # Merge all FTS5 segments into one and restore automerge
     if indexed > 0:
         conn.execute("INSERT INTO messages(messages) VALUES('optimize')")
         conn.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 4)")
-        conn.commit()
 
     # Get totals
     total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -686,11 +712,12 @@ def main():
     parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
     parser.add_argument("query", nargs="?", help="Search query; optional in --list mode to filter listed sessions")
     parser.add_argument("--list", action="store_true", help="List recent sessions; optional QUERY filters the list")
-    parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
+    parser.add_argument("--project", help="Filter to sessions from an exact project path or its child paths")
     parser.add_argument("--days", type=int, help="Only sessions from last N days")
     parser.add_argument("--source", choices=["claude", "codex"], help="Filter by source (claude or codex)")
     parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
     parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
+    parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
     args = parser.parse_args()
     if not args.list and not args.query:
@@ -708,9 +735,15 @@ def main():
     create_schema(conn)
     migrate_schema(conn)
 
-    # Index
+    # Index (single writer transaction for better concurrent safety)
     t0 = time.time()
-    indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=args.reindex)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=args.reindex)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     index_time = time.time() - t0
 
     if indexed > 0:
@@ -749,7 +782,51 @@ def main():
             results = results[:args.limit]
 
     if not results:
-        print("No sessions found." if args.list else "No matching sessions found.")
+        if args.json:
+            payload = {
+                "mode": "list" if args.list else "search",
+                "query": args.query,
+                "filters": {
+                    "project": args.project,
+                    "days": args.days,
+                    "source": args.source,
+                    "limit": args.limit,
+                },
+                "index": {
+                    "indexed": indexed,
+                    "skipped": skipped,
+                    "orphaned": orphaned,
+                    "total_sessions": total_sessions,
+                    "total_messages": total_messages,
+                },
+                "results": [],
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("No sessions found." if args.list else "No matching sessions found.")
+        conn.close()
+        return
+
+    if args.json:
+        payload = {
+            "mode": "list" if args.list else "search",
+            "query": args.query,
+            "filters": {
+                "project": args.project,
+                "days": args.days,
+                "source": args.source,
+                "limit": args.limit,
+            },
+            "index": {
+                "indexed": indexed,
+                "skipped": skipped,
+                "orphaned": orphaned,
+                "total_sessions": total_sessions,
+                "total_messages": total_messages,
+            },
+            "results": [result_to_dict(row) for row in results],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         conn.close()
         return
 
@@ -759,11 +836,15 @@ def main():
     for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank) in enumerate(results, 1):
         date = format_timestamp(timestamp)
         src_tag = f"[{source}]" if source else ""
+        parent_session_id = subagent_parent_session_id(file_path)
+        subagent_tag = f" [subagent of {parent_session_id}]" if parent_session_id else ""
         proj_name = Path(project).name if project else "unknown"
-        print(f"[{i}] {date} | {slug} | {proj_name} {src_tag}")
+        print(f"[{i}] {date} | {slug} | {proj_name} {src_tag}{subagent_tag}")
         if project:
             print(f"    {project}")
         print(f"    ID: {session_id}")
+        if parent_session_id:
+            print(f"    Parent Session: {parent_session_id}")
         if file_path:
             print(f"    File: {file_path}")
         if excerpt:

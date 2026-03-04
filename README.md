@@ -24,6 +24,9 @@ python3 scripts/recall.py --list "auth api" --source codex --limit 20
 
 # Search only Codex sessions from the last 7 days
 python3 scripts/recall.py "mock api" --source codex --days 7
+
+# JSON output for scripts/tooling
+python3 scripts/recall.py --json --source codex --list "auth api"
 ```
 
 ## How it works
@@ -50,6 +53,8 @@ python3 scripts/recall.py "mock api" --source codex --days 7
 - Results ranked by BM25 with a slight recency bias (recent sessions get up to a 20% boost, decaying with a 30-day half-life)
 - Adds a CJK substring fallback for simple Chinese/Japanese/Korean queries when FTS recall is sparse
 - Supports `--list [QUERY]` to browse recent sessions, with optional text filtering
+- Supports `--json` output for machine-readable downstream processing
+- Marks Claude subagent transcripts as `[subagent of <parent-session-id>]` in text output
 - Results tagged `[claude]` or `[codex]` with highlighted excerpts
 - No dependencies — Python 3.9+ stdlib only (sqlite3, json, argparse)
 

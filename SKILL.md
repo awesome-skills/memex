@@ -6,7 +6,7 @@ description: >
   "what did we discuss", "remember when we"
 metadata:
   author: arjunkmrm
-  version: "0.2.2"
+  version: "0.3.0"
   license: MIT
 ---
 
@@ -17,7 +17,7 @@ Search all past Claude Code and Codex sessions using full-text search with BM25 
 ## Usage
 
 ```bash
-python3 ~/.claude/skills/recall/scripts/recall.py QUERY [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex]
+python3 ~/.claude/skills/recall/scripts/recall.py [QUERY] [--list] [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex]
 ```
 
 ## Examples
@@ -46,6 +46,9 @@ python3 ~/.claude/skills/recall/scripts/recall.py "buffer" --source codex
 
 # Force reindex
 python3 ~/.claude/skills/recall/scripts/recall.py --reindex "test"
+
+# List recent sessions
+python3 ~/.claude/skills/recall/scripts/recall.py --list --limit 20
 ```
 
 ## Query Syntax (FTS5)
@@ -83,5 +86,7 @@ If results are missing `File:` paths, run `--reindex` to backfill.
 - Index is stored at `~/.recall.db` (SQLite FTS5, auto-migrated from `~/.claude/recall.db`)
 - Indexes both `~/.claude/projects/` (Claude Code) and `~/.codex/sessions/` (Codex)
 - First run indexes all sessions (a few seconds); subsequent runs are incremental
+- Automatically prunes orphaned DB rows when indexed source files are removed
 - Only user and assistant messages are indexed (tool calls, thinking blocks, state snapshots skipped)
 - Results show `[claude]` or `[codex]` tags to indicate the source
+- For simple CJK queries, adds substring fallback matching to improve recall

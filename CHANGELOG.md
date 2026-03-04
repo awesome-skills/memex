@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add `--list` mode to list sessions by recency without a full-text query
+- Add orphan cleanup during indexing (removes DB rows whose source JSONL no longer exists)
+- Add CJK substring fallback for simple Chinese/Japanese/Korean queries to improve recall
+- Avoid unnecessary FTS automerge writes when no files changed
+
 ## 0.2.2
 
 - Add slight recency bias to search ranking

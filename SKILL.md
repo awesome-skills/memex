@@ -5,8 +5,8 @@ description: >
   "find a past session", "recall a previous conversation", "search session history",
   "what did we discuss", "remember when we"
 metadata:
-  author: arjunkmrm
-  version: "0.3.0"
+  author: awesome-skills
+  version: "0.4.0"
   license: MIT
 ---
 
@@ -17,7 +17,7 @@ Search all past Claude Code and Codex sessions using full-text search with BM25 
 ## Usage
 
 ```bash
-python3 <RECALL_SKILL_DIR>/scripts/recall.py [QUERY] [--list] [--project PATH] [--days N] [--source claude|codex] [--limit N] [--offset N] [--include-subagents] [--reindex] [--json]
+python3 <RECALL_SKILL_DIR>/scripts/recall.py [QUERY] [--list] [--project PATH] [--days N] [--source claude|codex] [--limit N] [--offset N] [--include-subagents] [--reindex] [--json] [--version] [--doctor]
 ```
 
 `<RECALL_SKILL_DIR>` varies by installation. Common examples:
@@ -65,6 +65,12 @@ python3 <RECALL_SKILL_DIR>/scripts/recall.py --list --limit 10 --offset 10
 
 # Include subagent sessions (hidden by default)
 python3 <RECALL_SKILL_DIR>/scripts/recall.py --list --include-subagents
+
+# Show installed version metadata
+python3 <RECALL_SKILL_DIR>/scripts/recall.py --version
+
+# Run local health checks
+python3 <RECALL_SKILL_DIR>/scripts/recall.py --doctor
 ```
 
 ## Query Syntax (FTS5)

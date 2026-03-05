@@ -62,6 +62,12 @@ recall.py --list --limit 10 --offset 10
 # Include subagent sessions (hidden by default)
 recall.py --list --include-subagents
 
+# Show installed version/build metadata
+recall.py --version
+
+# Run local health checks
+recall.py --doctor
+
 # Machine-readable output
 recall.py --json "deploy"
 ```
@@ -120,6 +126,8 @@ Options:
   --include-subagents       Include subagent sessions in results
   --json                    Machine-readable JSON output
   --reindex                 Force full index rebuild
+  --version                 Show version/schema/commit metadata and exit
+  --doctor                  Run local health checks and exit
 ```
 
 ### Under the hood
@@ -134,7 +142,7 @@ Options:
 | **Subagents** | Indexed with parent session ID; hidden by default, `--include-subagents` to show |
 | **Dependencies** | Zero — Python 3.9+ stdlib only |
 | **Migration** | Auto-migrates from legacy `~/.claude/recall.db` |
-| **Tests** | 66 regression tests (unittest) |
+| **Tests** | 69 regression tests (unittest) |
 
 ---
 
@@ -168,6 +176,12 @@ recall.py --list --limit 10 --offset 10
 
 # 显示子代理会话（默认隐藏）
 recall.py --list --include-subagents
+
+# 查看安装版本/构建信息
+recall.py --version
+
+# 运行本地健康检查
+recall.py --doctor
 
 # 输出 JSON（方便脚本消费）
 recall.py --json "部署"
@@ -227,6 +241,8 @@ recall.py [QUERY] [选项]
   --include-subagents       显示子代理会话
   --json                    输出机器可读的 JSON
   --reindex                 强制重建索引
+  --version                 显示版本/Schema/提交信息并退出
+  --doctor                  运行本地健康检查并退出
 ```
 
 ### 技术细节

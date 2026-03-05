@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import math
 import time
@@ -17,7 +18,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from recall_common import SKIP_MARKERS, extract_text, is_noise
+from recall_common import extract_text, is_noise
+
+SKILL_NAME = "recall"
+SKILL_OWNER = "awesome-skills"
+SKILL_VERSION = "0.4.0"
+SCHEMA_VERSION = 1
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
@@ -69,6 +75,81 @@ def migrate_schema(conn):
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT {default}")
             conn.commit()
+    current_ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if int(current_ver or 0) < SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def get_db_schema_version(conn):
+    """Read SQLite schema version from PRAGMA user_version."""
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    except (sqlite3.OperationalError, ValueError, TypeError):
+        return None
+    return None
+
+
+def detect_commit_sha():
+    """Best-effort git commit detection for local/source installs."""
+    candidates = [SCRIPT_DIR, SCRIPT_DIR.parent]
+    for candidate in candidates:
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", str(candidate), "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if commit:
+                return commit
+        except (subprocess.CalledProcessError, FileNotFoundError, PermissionError, OSError):
+            continue
+    return "unknown"
+
+
+def read_db_schema_version(db_path):
+    """Read schema version from an existing DB path without creating a new DB."""
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return get_db_schema_version(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def build_version_payload():
+    """Create version payload for CLI/text output."""
+    db_schema = read_db_schema_version(DB_PATH)
+    return {
+        "name": SKILL_NAME,
+        "owner": SKILL_OWNER,
+        "version": SKILL_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "db_schema_version": db_schema,
+        "db_path": str(DB_PATH),
+        "db_exists": DB_PATH.exists(),
+        "commit": detect_commit_sha(),
+    }
+
+
+def print_version(json_mode=False):
+    """Print version details and return."""
+    payload = build_version_payload()
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    db_schema = payload["db_schema_version"]
+    db_schema_str = str(db_schema) if db_schema is not None else "none"
+    print(f"{payload['name']} {payload['version']}")
+    print(f"owner: {payload['owner']}")
+    print(f"schema: {payload['schema_version']} (db: {db_schema_str})")
+    print(f"commit: {payload['commit']}")
+    print(f"db: {payload['db_path']}")
 
 
 def migrate_db_location():
@@ -923,6 +1004,126 @@ def format_timestamp(ts_ms, precise=False):
         return "unknown"
 
 
+def format_epoch_seconds(ts_seconds, precise=True):
+    """Format epoch seconds to a local time string."""
+    if ts_seconds is None:
+        return "unknown"
+    try:
+        fmt = "%Y-%m-%d %H:%M:%S" if precise else "%Y-%m-%d"
+        return time.strftime(fmt, time.localtime(float(ts_seconds)))
+    except (OSError, ValueError, TypeError):
+        return "unknown"
+
+
+def build_doctor_payload(conn):
+    """Collect health diagnostics for the local recall index."""
+    can_write = True
+    write_error = ""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+    except sqlite3.Error as e:
+        can_write = False
+        write_error = str(e)
+
+    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    subagent_sessions = conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE COALESCE(is_subagent, 0) = 1"
+    ).fetchone()[0]
+    source_rows = conn.execute(
+        "SELECT source, COUNT(*) FROM sessions GROUP BY source ORDER BY source"
+    ).fetchall()
+    by_source = {source: count for source, count in source_rows}
+    latest_session_ts = conn.execute("SELECT MAX(timestamp) FROM sessions").fetchone()[0]
+    latest_mtime = conn.execute("SELECT MAX(mtime) FROM sessions").fetchone()[0]
+
+    db_exists = DB_PATH.exists()
+    db_size_bytes = DB_PATH.stat().st_size if db_exists else 0
+    wal_path = Path(str(DB_PATH) + "-wal")
+    shm_path = Path(str(DB_PATH) + "-shm")
+    wal_size_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+    shm_size_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+
+    checks = {
+        "db_exists": db_exists,
+        "db_writable": can_write,
+        "claude_projects_dir_exists": CLAUDE_PROJECTS_DIR.is_dir(),
+        "codex_sessions_dir_exists": CODEX_SESSIONS_DIR.is_dir(),
+    }
+    warnings = []
+    if not checks["db_writable"]:
+        warnings.append(f"DB not writable: {write_error}")
+    if not checks["claude_projects_dir_exists"] and not checks["codex_sessions_dir_exists"]:
+        warnings.append("Neither Claude nor Codex session directory exists.")
+    if total_sessions == 0:
+        warnings.append("Index is empty. Run a search/list once to trigger indexing.")
+
+    return {
+        "name": SKILL_NAME,
+        "owner": SKILL_OWNER,
+        "version": SKILL_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "db_schema_version": get_db_schema_version(conn),
+        "commit": detect_commit_sha(),
+        "checks": checks,
+        "paths": {
+            "db": str(DB_PATH),
+            "claude_projects": str(CLAUDE_PROJECTS_DIR),
+            "codex_sessions": str(CODEX_SESSIONS_DIR),
+        },
+        "sizes": {
+            "db_bytes": db_size_bytes,
+            "wal_bytes": wal_size_bytes,
+            "shm_bytes": shm_size_bytes,
+        },
+        "index": {
+            "total_sessions": total_sessions,
+            "total_messages": total_messages,
+            "subagent_sessions": subagent_sessions,
+            "sessions_by_source": by_source,
+            "latest_session_at": format_timestamp(latest_session_ts, precise=True),
+            "latest_indexed_file_mtime": format_epoch_seconds(latest_mtime, precise=True),
+        },
+        "warnings": warnings,
+    }
+
+
+def print_doctor(payload, json_mode=False):
+    """Print doctor diagnostics in text or JSON form."""
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    checks = payload["checks"]
+    status = "OK" if not payload["warnings"] else "WARN"
+    print(f"{payload['name']} doctor: {status}")
+    print(f"version: {payload['version']}  commit: {payload['commit']}")
+    print(
+        "schema: "
+        f"{payload['schema_version']} (db: {payload['db_schema_version'] if payload['db_schema_version'] is not None else 'none'})"
+    )
+    print(f"db: {payload['paths']['db']}")
+    print(f"db writable: {'yes' if checks['db_writable'] else 'no'}")
+    print(f"claude dir exists: {'yes' if checks['claude_projects_dir_exists'] else 'no'}")
+    print(f"codex dir exists: {'yes' if checks['codex_sessions_dir_exists'] else 'no'}")
+    print(
+        "index: "
+        f"{payload['index']['total_sessions']} sessions, "
+        f"{payload['index']['total_messages']} messages, "
+        f"{payload['index']['subagent_sessions']} subagents"
+    )
+    print(
+        "latest: "
+        f"session={payload['index']['latest_session_at']}, "
+        f"indexed_file_mtime={payload['index']['latest_indexed_file_mtime']}"
+    )
+    if payload["warnings"]:
+        print("warnings:")
+        for warning in payload["warnings"]:
+            print(f"  - {warning}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
     parser.add_argument("query", nargs="?", help="Search query; optional in --list mode to filter listed sessions")
@@ -935,10 +1136,19 @@ def main():
     parser.add_argument("--include-subagents", action="store_true", help="Include subagent sessions in results")
     parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    parser.add_argument("--version", action="store_true", help="Show skill/version metadata and exit")
+    parser.add_argument("--doctor", action="store_true", help="Run local health checks and exit")
 
     args = parser.parse_args()
-    if not args.list and not args.query:
-        parser.error("QUERY is required unless --list is used")
+    if args.version:
+        if args.list or args.query or args.doctor or args.reindex:
+            parser.error("--version cannot be combined with search/list/doctor options")
+        print_version(json_mode=args.json)
+        return
+    if args.doctor and (args.list or args.query):
+        parser.error("--doctor cannot be combined with search/list query arguments")
+    if not args.list and not args.query and not args.doctor:
+        parser.error("QUERY is required unless --list or --doctor is used")
 
     inc_sub = args.include_subagents
 
@@ -953,6 +1163,12 @@ def main():
     conn.execute("PRAGMA synchronous=NORMAL")
     create_schema(conn)
     migrate_schema(conn)
+
+    if args.doctor:
+        payload = build_doctor_payload(conn)
+        print_doctor(payload, json_mode=args.json)
+        conn.close()
+        return
 
     # Index (single writer transaction for better concurrent safety)
     t0 = time.time()

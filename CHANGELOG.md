@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fork identity and diagnostics
+- Update skill metadata to fork ownership (`awesome-skills`) and bump skill version to `0.4.0`
+- Add `--version` to print version metadata, schema version, DB schema, and commit SHA
+- Add `--doctor` to run local health checks (DB writability, source directories, index stats, latest index timestamps)
+
 ### Session overview
 - Store first meaningful user message as `summary` in sessions table
 - Show summary line in `--list` and search output — no more guessing what a session was about
@@ -30,7 +35,7 @@
 - `os.walk` replaces recursive `glob` — only files in changed directories are stat'd
 
 ### Tests
-- Add 66-test regression suite covering query sanitization, project matching, CJK fallback, orphan cleanup, subagent filtering, slug deduplication, directory checkpoints, noise filtering, schema migration
+- Add 69-test regression suite covering query sanitization, project matching, CJK fallback, orphan cleanup, subagent filtering, slug deduplication, directory checkpoints, noise filtering, schema migration, version/doctor diagnostics
 
 ### Previous (carried from earlier PRs)
 - Add `--list` mode to list sessions by recency without a full-text query

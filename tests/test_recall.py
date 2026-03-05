@@ -570,5 +570,49 @@ class TestSchemaMigration(unittest.TestCase):
         conn.close()
 
 
+class TestVersionHelpers(unittest.TestCase):
+
+    def test_build_version_payload_without_db(self):
+        with patch.object(recall, "DB_PATH", Path("/tmp/nonexistent-recall-db.sqlite")), \
+             patch.object(recall, "detect_commit_sha", return_value="abc1234"):
+            payload = recall.build_version_payload()
+        self.assertEqual(payload["name"], "recall")
+        self.assertEqual(payload["owner"], "awesome-skills")
+        self.assertEqual(payload["version"], recall.SKILL_VERSION)
+        self.assertEqual(payload["schema_version"], recall.SCHEMA_VERSION)
+        self.assertEqual(payload["commit"], "abc1234")
+        self.assertFalse(payload["db_exists"])
+        self.assertIsNone(payload["db_schema_version"])
+
+    def test_read_db_schema_version(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = Path(f.name)
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+            conn.close()
+            self.assertEqual(recall.read_db_schema_version(db_path), 7)
+        finally:
+            if db_path.exists():
+                db_path.unlink()
+
+
+class TestDoctorPayload(DBTestCase):
+
+    def test_doctor_payload_contains_expected_fields(self):
+        self._insert_session("s1", source="codex", summary="hello")
+        self._insert_messages("s1", [("user", "hello")])
+        payload = recall.build_doctor_payload(self.conn)
+        self.assertEqual(payload["name"], "recall")
+        self.assertIn("checks", payload)
+        self.assertIn("index", payload)
+        self.assertEqual(payload["index"]["total_sessions"], 1)
+        self.assertEqual(payload["index"]["total_messages"], 1)
+        self.assertEqual(payload["index"]["sessions_by_source"].get("codex"), 1)
+        self.assertIn("latest_session_at", payload["index"])
+        self.assertIn("latest_indexed_file_mtime", payload["index"])
+
+
 if __name__ == "__main__":
     unittest.main()

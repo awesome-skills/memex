@@ -58,26 +58,43 @@ def create_schema(conn):
             text,
             tokenize='porter unicode61'
         );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_ts
+            ON sessions(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_source
+            ON sessions(source);
+        CREATE INDEX IF NOT EXISTS idx_sessions_subagent
+            ON sessions(is_subagent);
     """)
 
 
 def migrate_schema(conn):
     """Add columns if upgrading from an older schema."""
-    for col, default in [
-        ("source", "'claude'"),
-        ("file_path", "''"),
-        ("summary", "''"),
-        ("is_subagent", "0"),
-        ("parent_session_id", "''"),
+    for col, col_type, default in [
+        ("source", "TEXT", "'claude'"),
+        ("file_path", "TEXT", "''"),
+        ("summary", "TEXT", "''"),
+        ("is_subagent", "INTEGER", "0"),
+        ("parent_session_id", "TEXT", "''"),
     ]:
         try:
             conn.execute(f"SELECT {col} FROM sessions LIMIT 1")
         except sqlite3.OperationalError:
-            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT {default}")
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type} DEFAULT {default}")
             conn.commit()
     current_ver = conn.execute("PRAGMA user_version").fetchone()[0]
     if int(current_ver or 0) < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    # Ensure indexes exist for databases created before indexes were added
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_subagent ON sessions(is_subagent)",
+    ]:
+        try:
+            conn.execute(idx_sql)
+        except sqlite3.OperationalError:
+            pass
 
 
 def get_db_schema_version(conn):
@@ -726,8 +743,8 @@ def index_sessions(conn, force=False):
     # Get existing mtimes keyed by file_path (stable across session_id changes)
     existing = {}
     try:
-        for row in conn.execute("SELECT file_path, session_id, mtime, timestamp FROM sessions"):
-            existing[row[0]] = (row[1], row[2], row[3])
+        for row in conn.execute("SELECT file_path, session_id, mtime, timestamp, source FROM sessions"):
+            existing[row[0]] = (row[1], row[2], row[3], row[4])
     except sqlite3.OperationalError:
         pass
 
@@ -735,6 +752,19 @@ def index_sessions(conn, force=False):
     sources = []
     sources.extend(_collect_files_with_dir_checkpoint(conn, CLAUDE_PROJECTS_DIR, "claude", force))
     sources.extend(_collect_files_with_dir_checkpoint(conn, CODEX_SESSIONS_DIR, "codex", force))
+
+    # Check already-indexed files for content updates even when dir mtime is unchanged.
+    # Appending to a JSONL file changes file mtime but not directory mtime.
+    if not force:
+        collected_paths = {fpath for fpath, _ in sources}
+        for file_path, (sid, stored_mtime, ts, src) in existing.items():
+            if file_path not in collected_paths:
+                try:
+                    current_mtime = os.path.getmtime(file_path)
+                except OSError:
+                    continue
+                if current_mtime != stored_mtime:
+                    sources.append((file_path, src))
 
     indexed = 0
     skipped = 0
@@ -836,8 +866,11 @@ def list_sessions(conn, project=None, days=None, source=None, limit=10, query=No
     try:
         rows = conn.execute(query_sql, query_params).fetchall()
     except sqlite3.OperationalError as e:
-        print(f"List query error: {e}", file=sys.stderr)
-        rows = []
+        print(f"List query error, falling back to LIKE: {e}", file=sys.stderr)
+        return search_like_fallback(
+            conn, query, project=project, days=days, source=source,
+            limit=limit, include_subagents=include_subagents,
+        )
 
     results = [(sid, src, fpath, proj, slug, ts, "", 0.0, summ) for sid, src, fpath, proj, slug, ts, summ in rows]
     if results:
@@ -894,12 +927,19 @@ def search_cjk_fallback(conn, query, project=None, days=None, source=None, limit
         print(f"CJK fallback search error: {e}", file=sys.stderr)
         return []
 
+    # Batch fetch excerpt texts (eliminates N per-row queries)
+    rowids = [row[1] for row in matched]
+    text_map = {}
+    if rowids:
+        ph = ",".join("?" * len(rowids))
+        for rid, txt in conn.execute(f"SELECT rowid, text FROM messages WHERE rowid IN ({ph})", rowids):
+            text_map[rid] = txt
+
     results = []
     now_ms = time.time() * 1000
     highlight_term = terms[0]
     for session_id, rowid, src, file_path, project_value, slug, timestamp, summary in matched:
-        text_row = conn.execute("SELECT text FROM messages WHERE rowid = ?", (rowid,)).fetchone()
-        excerpt = make_excerpt(text_row[0] if text_row else "", highlight_term)
+        excerpt = make_excerpt(text_map.get(rowid, ""), highlight_term)
 
         if timestamp:
             age_days = max((now_ms - timestamp) / 86_400_000, 0)
@@ -946,16 +986,23 @@ def search_like_fallback(conn, query, project=None, days=None, source=None, limi
         print(f"LIKE fallback search error: {e}", file=sys.stderr)
         return []
 
+    # Batch fetch excerpt texts (eliminates N per-row queries)
+    rowids = [row[1] for row in matched]
+    text_map = {}
+    if rowids:
+        ph = ",".join("?" * len(rowids))
+        for rid, txt in conn.execute(f"SELECT rowid, text FROM messages WHERE rowid IN ({ph})", rowids):
+            text_map[rid] = txt
+
     results = []
     for session_id, rowid, src, file_path, project_value, slug_val, timestamp, summary in matched:
-        text_row = conn.execute("SELECT text FROM messages WHERE rowid = ?", (rowid,)).fetchone()
-        excerpt = make_excerpt(text_row[0] if text_row else "", query)
+        excerpt = make_excerpt(text_map.get(rowid, ""), query)
         results.append((session_id, src, file_path, project_value, slug_val, timestamp, excerpt, 0.0, summary or ""))
 
     return results
 
 
-def search(conn, query, project=None, days=None, source=None, limit=10, include_subagents=False):
+def search(conn, query, project=None, days=None, source=None, limit=10, include_subagents=False, offset=0):
     """Search indexed sessions."""
     safe_query = sanitize_fts_query(query)
 
@@ -977,7 +1024,7 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
 
     # Over-fetch candidates so recency re-ranking can surface recent results
     # that pure BM25 might have ranked just outside the cutoff.
-    candidate_limit = limit * 3
+    candidate_limit = (offset + limit) * 3
     fts_params.append(candidate_limit)
 
     # First find best-ranking session_ids.
@@ -1001,18 +1048,27 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
             limit=limit, include_subagents=include_subagents,
         )
 
+    if not ranked:
+        return []
+
+    # Batch fetch session metadata (eliminates N per-session queries)
+    session_ids = [sid for sid, _ in ranked]
+    ph = ",".join("?" * len(session_ids))
+    meta_rows = conn.execute(
+        f"SELECT session_id, source, file_path, project, slug, timestamp, summary "
+        f"FROM sessions WHERE session_id IN ({ph})",
+        session_ids,
+    ).fetchall()
+    meta_map = {row[0]: row[1:] for row in meta_rows}
+
     results = []
     now_ms = time.time() * 1000
     for session_id, rank in ranked:
-        # Get session metadata
-        meta = conn.execute(
-            "SELECT source, file_path, project, slug, timestamp, summary FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        meta = meta_map.get(session_id)
         if not meta:
             continue
 
-        # Get snippet from the best-matching row
+        # Snippet still per-session (FTS5 snippet() requires MATCH context)
         snippet_row = conn.execute(
             "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ? AND session_id = ? LIMIT 1",
             (safe_query, session_id),
@@ -1022,25 +1078,25 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
         # Apply recency bias: blend BM25 score with a time-decay boost.
         # BM25 rank is negative (more negative = better match).
         # Recency boost: 1.0 for today, decaying with a half-life of 30 days.
+        # Multiplying negative rank by (1 + boost) makes it MORE negative = better.
         timestamp = meta[4]
         if timestamp:
             age_days = max((now_ms - timestamp) / 86_400_000, 0)
             recency_boost = math.exp(-0.693 * age_days / 30)  # half-life = 30 days
         else:
             recency_boost = 0.0
-        # Blend: 80% BM25, 20% recency. Recency term scales with typical BM25 magnitude.
-        blended_rank = rank * (1 - 0.2 * recency_boost)
+        blended_rank = rank * (1 + 0.2 * recency_boost)
 
         results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, blended_rank, meta[5] or ""))
 
-    # Re-sort by blended rank and trim to requested limit.
+    # Re-sort by blended rank and apply offset + limit.
     results.sort(key=lambda r: r[7])
-    return results[:limit]
+    return results[offset:offset + limit]
 
 
 def format_timestamp(ts_ms, precise=False):
     """Format millisecond timestamp to date string."""
-    if not ts_ms:
+    if ts_ms is None or ts_ms <= 0:
         return "unknown"
     try:
         ts = float(ts_ms) / 1000  # epoch ms to seconds
@@ -1278,73 +1334,105 @@ def main():
     os.umask(old_umask)
     if new_db:
         os.chmod(str(DB_PATH), 0o600)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    create_schema(conn)
-    migrate_schema(conn)
-
-    if args.doctor:
-        payload = build_doctor_payload(conn)
-        if args.fix:
-            actions = apply_doctor_fixes(conn, payload)
-            payload = build_doctor_payload(conn, fix_applied=True, actions=actions)
-        print_doctor(payload, json_mode=args.json)
-        conn.close()
-        return
-
-    # Index (single writer transaction for better concurrent safety)
-    t0 = time.time()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=args.reindex)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    index_time = time.time() - t0
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        create_schema(conn)
+        migrate_schema(conn)
 
-    if indexed > 0:
-        print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
-    if orphaned > 0:
-        print(f"Pruned {orphaned} orphaned sessions", file=sys.stderr)
+        if args.doctor:
+            payload = build_doctor_payload(conn)
+            if args.fix:
+                actions = apply_doctor_fixes(conn, payload)
+                payload = build_doctor_payload(conn, fix_applied=True, actions=actions)
+            print_doctor(payload, json_mode=args.json)
+            return
 
-    # Search or list
-    if args.list:
-        results = list_sessions(
-            conn,
-            project=args.project,
-            days=args.days,
-            source=args.source,
-            limit=args.limit,
-            query=args.query,
-            include_subagents=inc_sub,
-            offset=args.offset,
-        )
-    else:
-        results = search(
-            conn, args.query, project=args.project, days=args.days,
-            source=args.source, limit=args.limit, include_subagents=inc_sub,
-        )
+        # Index (single writer transaction for better concurrent safety)
+        t0 = time.time()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=args.reindex)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        index_time = time.time() - t0
 
-        # For simple Chinese queries, augment sparse FTS results with substring fallback.
-        if contains_cjk(args.query) and is_simple_query(args.query) and len(results) < args.limit:
-            fallback = search_cjk_fallback(
+        if indexed > 0:
+            print(f"Indexed {indexed} sessions in {index_time:.1f}s", file=sys.stderr)
+        if orphaned > 0:
+            print(f"Pruned {orphaned} orphaned sessions", file=sys.stderr)
+
+        # Search or list
+        if args.list:
+            results = list_sessions(
                 conn,
-                args.query,
                 project=args.project,
                 days=args.days,
                 source=args.source,
                 limit=args.limit,
+                query=args.query,
                 include_subagents=inc_sub,
+                offset=args.offset,
             )
-            existing_ids = {row[0] for row in results}
-            for row in fallback:
-                if row[0] not in existing_ids:
-                    results.append(row)
-            results.sort(key=lambda r: r[7])
-            results = results[:args.limit]
+        else:
+            results = search(
+                conn, args.query, project=args.project, days=args.days,
+                source=args.source, limit=args.limit, include_subagents=inc_sub,
+                offset=args.offset,
+            )
 
-    if not results:
+            # For simple Chinese queries, augment sparse FTS results with substring fallback.
+            if contains_cjk(args.query) and is_simple_query(args.query) and len(results) < args.limit:
+                fallback = search_cjk_fallback(
+                    conn,
+                    args.query,
+                    project=args.project,
+                    days=args.days,
+                    source=args.source,
+                    limit=args.limit,
+                    include_subagents=inc_sub,
+                )
+                existing_ids = {row[0] for row in results}
+                for row in fallback:
+                    if row[0] not in existing_ids:
+                        results.append(row)
+                results.sort(key=lambda r: r[7])
+                results = results[:args.limit]
+
+        if not results:
+            if args.json:
+                payload = {
+                    "mode": "list" if args.list else "search",
+                    "query": args.query,
+                    "filters": {
+                        "project": args.project,
+                        "days": args.days,
+                        "source": args.source,
+                        "limit": args.limit,
+                        "offset": args.offset,
+                        "include_subagents": inc_sub,
+                    },
+                    "index": {
+                        "total_sessions": total_sessions,
+                        "total_messages": total_messages,
+                    },
+                    "output": {
+                        "summary_len": args.summary_len,
+                        "summary_enabled": show_summary,
+                    },
+                    "results": [],
+                }
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print("No sessions found." if args.list else "No matching sessions found.")
+            return
+
+        # Deduplicate slugs across results
+        display_slugs = deduplicate_slugs(results)
+
         if args.json:
             payload = {
                 "mode": "list" if args.list else "search",
@@ -1365,80 +1453,51 @@ def main():
                     "summary_len": args.summary_len,
                     "summary_enabled": show_summary,
                 },
-                "results": [],
             }
+            payload["results"] = [
+                result_to_dict(
+                    row,
+                    display_slugs.get(row[0]),
+                    summary_len=args.summary_len,
+                    include_summary=show_summary,
+                )
+                for row in results
+            ]
             print(json.dumps(payload, ensure_ascii=False, indent=2))
-        else:
-            print("No sessions found." if args.list else "No matching sessions found.")
+            return
+
+        verb = "Listed" if args.list else "Found"
+        print(f"{verb} {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
+
+        for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank, summary) in enumerate(results, 1):
+            date = format_timestamp(timestamp, precise=True)
+            src_tag = f"[{source}]" if source else ""
+            parent_sid = subagent_parent_session_id(file_path)
+            subagent_tag = f" [subagent of {parent_sid}]" if parent_sid else ""
+            proj_name = Path(project).name if project else "unknown"
+            display_slug = display_slugs.get(session_id, slug)
+            print(f"[{i}] {date} | {proj_name} {src_tag}{subagent_tag}")
+            summary_display = truncate_summary(summary, args.summary_len) if show_summary else ""
+            if summary_display:
+                print(f"    {summary_display}")
+            if project:
+                print(f"    Project: {project}")
+            print(f"    ID: {session_id}")
+            if display_slug and display_slug != session_id:
+                print(f"    Slug: {display_slug}")
+            if parent_sid:
+                print(f"    Parent: {parent_sid}")
+            if file_path:
+                print(f"    File: {file_path}")
+            resume_cmd = build_resume_command(source, project, session_id)
+            if resume_cmd:
+                print(f"    Resume: {resume_cmd}")
+            if excerpt:
+                excerpt_clean = make_excerpt(excerpt)
+                print(f"    > {excerpt_clean}")
+            print()
+    finally:
         conn.close()
-        return
-
-    # Deduplicate slugs across results
-    display_slugs = deduplicate_slugs(results)
-
-    if args.json:
-        payload = {
-            "mode": "list" if args.list else "search",
-            "query": args.query,
-            "filters": {
-                "project": args.project,
-                "days": args.days,
-                "source": args.source,
-                "limit": args.limit,
-                "offset": args.offset,
-                "include_subagents": inc_sub,
-            },
-            "index": {
-                "total_sessions": total_sessions,
-                "total_messages": total_messages,
-            },
-            "output": {
-                "summary_len": args.summary_len,
-                "summary_enabled": show_summary,
-            },
-        }
-        payload["results"] = [
-            result_to_dict(
-                row,
-                display_slugs.get(row[0]),
-                summary_len=args.summary_len,
-                include_summary=show_summary,
-            )
-            for row in results
-        ]
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        conn.close()
-        return
-
-    verb = "Listed" if args.list else "Found"
-    print(f"{verb} {len(results)} sessions (index: {total_sessions} sessions, {total_messages} messages):\n")
-
-    for i, (session_id, source, file_path, project, slug, timestamp, excerpt, rank, summary) in enumerate(results, 1):
-        date = format_timestamp(timestamp, precise=True)
-        src_tag = f"[{source}]" if source else ""
-        parent_sid = subagent_parent_session_id(file_path)
-        subagent_tag = f" [subagent of {parent_sid}]" if parent_sid else ""
-        proj_name = Path(project).name if project else "unknown"
-        display_slug = display_slugs.get(session_id, slug)
-        print(f"[{i}] {date} | {proj_name} {src_tag}{subagent_tag}")
-        summary_display = truncate_summary(summary, args.summary_len) if show_summary else ""
-        if summary_display:
-            print(f"    {summary_display}")
-        if project:
-            print(f"    Project: {project}")
-        print(f"    ID: {session_id}")
-        if display_slug and display_slug != session_id:
-            print(f"    Slug: {display_slug}")
-        if parent_sid:
-            print(f"    Parent: {parent_sid}")
-        if file_path:
-            print(f"    File: {file_path}")
-        if excerpt:
-            excerpt_clean = make_excerpt(excerpt)
-            print(f"    > {excerpt_clean}")
-        print()
-
-    conn.close()
 
 
 if __name__ == "__main__":

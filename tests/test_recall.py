@@ -716,5 +716,351 @@ class TestDoctorFixes(DBTestCase):
             self.assertTrue(refreshed["actions"])
 
 
+# ── Recency ranking direction ─────────────────────────────────────────────
+
+class TestRecencyRanking(DBTestCase):
+    """Recent sessions must rank higher than older ones at equal BM25 relevance."""
+
+    def test_recent_session_ranks_higher(self):
+        now_ms = int(time.time() * 1000)
+        old_ts = now_ms - 90 * 86_400_000  # 90 days ago
+        new_ts = now_ms - 1 * 86_400_000   # 1 day ago
+
+        self._insert_session("old-session", timestamp=old_ts)
+        self._insert_messages("old-session", [("user", "websocket reconnect strategy")])
+        self._insert_session("new-session", timestamp=new_ts)
+        self._insert_messages("new-session", [("user", "websocket reconnect strategy")])
+
+        results = recall.search(self.conn, "websocket reconnect", include_subagents=True)
+        self.assertEqual(len(results), 2)
+        # Recent session should appear first (lower blended rank)
+        self.assertEqual(results[0][0], "new-session")
+        self.assertEqual(results[1][0], "old-session")
+
+
+# ── Incremental index: file update without dir mtime change ──────────────
+
+class TestIncrementalIndexFileUpdate(DBTestCase):
+    """Appended file content must be re-indexed even if directory mtime is unchanged."""
+
+    def test_appended_file_reindexed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = os.path.join(tmpdir, "test-session.jsonl")
+            with open(session_file, "w") as f:
+                f.write(json.dumps({
+                    "type": "user", "role": "user",
+                    "message": {"content": "initial message"},
+                    "timestamp": "2026-03-04T10:00:00Z",
+                }) + "\n")
+
+            claude_dir = Path(tmpdir)
+            with patch.object(recall, "CLAUDE_PROJECTS_DIR", claude_dir), \
+                 patch.object(recall, "CODEX_SESSIONS_DIR", Path("/nonexistent")):
+                # First full index
+                recall.index_sessions(self.conn, force=True)
+                msgs1 = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+                # Append new content — preserve dir mtime to simulate the bug
+                dir_stat = os.stat(tmpdir)
+                with open(session_file, "a") as f:
+                    f.write(json.dumps({
+                        "type": "assistant", "role": "assistant",
+                        "message": {"content": "new assistant response"},
+                        "timestamp": "2026-03-04T10:01:00Z",
+                    }) + "\n")
+                os.utime(tmpdir, (dir_stat.st_atime, dir_stat.st_mtime))
+
+                # Incremental index should still detect the file change
+                recall.index_sessions(self.conn, force=False)
+                msgs2 = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+            self.assertGreater(msgs2, msgs1)
+
+
+# ── List mode FTS fallback ───────────────────────────────────────────────
+
+class TestListFTSFallback(DBTestCase):
+    """--list with query should fall back to LIKE when FTS fails."""
+
+    def test_fts_error_falls_back_to_like(self):
+        self._insert_session("s1", project="/test")
+        self._insert_messages("s1", [("user", "deploy kubernetes cluster")])
+
+        # Force FTS error by making sanitize_fts_query return invalid syntax
+        with patch.object(recall, "sanitize_fts_query", return_value="NEAR(broken"):
+            results = recall.list_sessions(
+                self.conn, query="deploy", include_subagents=True,
+            )
+        # Should find the result via LIKE fallback instead of returning empty
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "s1")
+
+
+# ── read_session.py noise filtering ──────────────────────────────────────
+
+class TestReadSessionNoiseFiltering(unittest.TestCase):
+    """read_session noise filter should use prefix matching, not substring."""
+
+    def test_mention_of_marker_in_body_not_filtered(self):
+        """User text that mentions a marker string mid-sentence should pass through."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({
+                "type": "user", "role": "user",
+                "message": {"content": "Can you explain what <system-reminder> tags do?"},
+            }) + "\n")
+            path = f.name
+
+        try:
+            import read_session
+            import importlib
+            importlib.reload(read_session)
+            messages = list(read_session.iter_messages(path))
+            self.assertEqual(len(messages), 1)
+        finally:
+            os.unlink(path)
+
+
+# ── Codex session parser ─────────────────────────────────────────────────
+
+class TestCodexSessionParser(unittest.TestCase):
+
+    def test_legacy_format_basic(self):
+        """Parse legacy Codex format with flat {role, content} entries."""
+        # Codex filenames start with "rollout-" — session_id override only triggers for this prefix
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "rollout-2026-03-04T10-00-00-aabbccdd.jsonl")
+        try:
+            with open(path, "w") as f:
+                entries = [
+                    {"id": "sess-legacy", "instructions": "You are helpful"},
+                    {"role": "user", "content": "hello codex"},
+                    {"role": "assistant", "content": "hi there"},
+                ]
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+
+            result = recall.parse_codex_session(path)
+            self.assertIsNotNone(result)
+            metadata, messages = result
+            self.assertEqual(metadata["source"], "codex")
+            self.assertEqual(metadata["session_id"], "sess-legacy")
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(metadata["summary"], "hello codex")
+        finally:
+            os.unlink(path)
+            os.rmdir(tmpdir)
+
+    def test_current_format_basic(self):
+        """Parse current Codex format with wrapped {type, payload} entries."""
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "rollout-2026-03-04T10-00-00-11223344.jsonl")
+        try:
+            with open(path, "w") as f:
+                entries = [
+                    {"timestamp": "2026-03-04T10:00:00Z", "type": "session_meta",
+                     "payload": {"id": "my-session", "cwd": "/tmp/test"}},
+                    {"timestamp": "2026-03-04T10:00:01Z", "type": "response_item",
+                     "payload": {"role": "user", "content": "hello"}},
+                    {"timestamp": "2026-03-04T10:00:02Z", "type": "response_item",
+                     "payload": {"role": "assistant", "content": "world"}},
+                ]
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+
+            result = recall.parse_codex_session(path)
+            self.assertIsNotNone(result)
+            metadata, messages = result
+            self.assertEqual(metadata["source"], "codex")
+            self.assertEqual(metadata["session_id"], "my-session")
+            self.assertEqual(metadata["project"], recall.normalize_project_path("/tmp/test"))
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(metadata["summary"], "hello")
+        finally:
+            os.unlink(path)
+            os.rmdir(tmpdir)
+
+    def test_state_records_skipped(self):
+        """Legacy state snapshots should be ignored."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            entries = [
+                {"record_type": "state", "data": "snapshot"},
+                {"role": "user", "content": "actual message"},
+            ]
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        try:
+            result = recall.parse_codex_session(path)
+            self.assertIsNotNone(result)
+            metadata, messages = result
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0][1], "actual message")
+        finally:
+            os.unlink(path)
+
+    def test_noise_filtered(self):
+        """System noise should be filtered from Codex sessions."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            entries = [
+                {"role": "user", "content": "<system-reminder>noise"},
+                {"role": "user", "content": "real question"},
+            ]
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        try:
+            result = recall.parse_codex_session(path)
+            metadata, messages = result
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0][1], "real question")
+            self.assertEqual(metadata["summary"], "real question")
+        finally:
+            os.unlink(path)
+
+    def test_event_msg_and_turn_context_skipped(self):
+        """Current format event_msg and turn_context entries should be skipped."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            entries = [
+                {"timestamp": "2026-03-04T10:00:00Z", "type": "event_msg", "payload": {}},
+                {"timestamp": "2026-03-04T10:00:01Z", "type": "turn_context", "payload": {}},
+                {"timestamp": "2026-03-04T10:00:02Z", "type": "response_item",
+                 "payload": {"role": "user", "content": "hello"}},
+            ]
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        try:
+            result = recall.parse_codex_session(path)
+            metadata, messages = result
+            self.assertEqual(len(messages), 1)
+        finally:
+            os.unlink(path)
+
+    def test_timestamp_extracted(self):
+        """Earliest timestamp should be captured from entries."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            entries = [
+                {"timestamp": "2026-03-04T12:00:00Z", "type": "response_item",
+                 "payload": {"role": "user", "content": "later"}},
+                {"timestamp": "2026-03-04T10:00:00Z", "type": "response_item",
+                 "payload": {"role": "user", "content": "earlier"}},
+            ]
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            path = f.name
+
+        try:
+            result = recall.parse_codex_session(path)
+            metadata, messages = result
+            self.assertIsNotNone(metadata["timestamp"])
+            # Earlier timestamp should be selected
+            earlier_ts = recall.parse_iso_timestamp("2026-03-04T10:00:00Z")
+            self.assertEqual(metadata["timestamp"], earlier_ts)
+        finally:
+            os.unlink(path)
+
+
+# ── CLI end-to-end ───────────────────────────────────────────────────────
+
+class TestCLIEndToEnd(DBTestCase):
+    """End-to-end tests for CLI output formats and behavior."""
+
+    def test_search_returns_results(self):
+        self._insert_session("s1", project="/test/proj", summary="hello world")
+        self._insert_messages("s1", [("user", "hello world search term")])
+
+        results = recall.search(self.conn, "hello", include_subagents=True)
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(results[0][0], "s1")
+
+    def test_json_result_has_all_fields(self):
+        self._insert_session("s1", project="/test", source="claude", summary="test summary")
+        self._insert_messages("s1", [("user", "hello search term")])
+
+        results = recall.search(self.conn, "hello", include_subagents=True)
+        self.assertGreaterEqual(len(results), 1)
+
+        display_slugs = recall.deduplicate_slugs(results)
+        result_dict = recall.result_to_dict(results[0], display_slugs.get(results[0][0]))
+
+        expected_fields = [
+            "session_id", "source", "file_path", "project", "slug",
+            "timestamp", "date", "summary", "excerpt", "rank",
+            "is_subagent", "parent_session_id", "resume_command",
+        ]
+        for field in expected_fields:
+            self.assertIn(field, result_dict, f"Missing field: {field}")
+
+    def test_list_with_offset_pagination(self):
+        for i in range(5):
+            ts = int(time.time() * 1000) - i * 86_400_000
+            self._insert_session(f"s{i}", timestamp=ts)
+            self._insert_messages(f"s{i}", [("user", f"message {i}")])
+
+        page1 = recall.list_sessions(self.conn, limit=2, offset=0, include_subagents=True)
+        page2 = recall.list_sessions(self.conn, limit=2, offset=2, include_subagents=True)
+
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        ids1 = {r[0] for r in page1}
+        ids2 = {r[0] for r in page2}
+        self.assertEqual(len(ids1 & ids2), 0)
+
+    def test_doctor_payload_has_suggestions(self):
+        payload = recall.build_doctor_payload(self.conn)
+        self.assertIn("suggestions", payload)
+        # Empty index should suggest reindex
+        self.assertTrue(any("reindex" in s.lower() for s in payload["suggestions"]))
+
+    def test_main_uses_busy_timeout(self):
+        """Verify main() sets busy_timeout."""
+        import inspect
+        source = inspect.getsource(recall.main)
+        self.assertIn("busy_timeout", source)
+
+
+# ── Search offset ────────────────────────────────────────────────────────
+
+class TestSearchOffset(DBTestCase):
+    """search() should support offset for pagination."""
+
+    def test_search_offset_skips_top_results(self):
+        now_ms = int(time.time() * 1000)
+        for i in range(5):
+            ts = now_ms - i * 86_400_000
+            self._insert_session(f"s{i}", timestamp=ts)
+            self._insert_messages(f"s{i}", [("user", "common search keyword")])
+
+        all_results = recall.search(
+            self.conn, "common search keyword", limit=5, include_subagents=True,
+        )
+        offset_results = recall.search(
+            self.conn, "common search keyword", limit=3, offset=2, include_subagents=True,
+        )
+
+        self.assertEqual(len(offset_results), 3)
+        # offset=2 results should match all_results[2:5]
+        all_ids = [r[0] for r in all_results]
+        offset_ids = [r[0] for r in offset_results]
+        self.assertEqual(offset_ids, all_ids[2:5])
+
+
+# ── Version consistency ──────────────────────────────────────────────────
+
+class TestVersionConsistency(unittest.TestCase):
+    """Verify version strings are consistent across files."""
+
+    def test_skill_md_matches_recall_version(self):
+        skill_md = Path(__file__).resolve().parent.parent / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        import re
+        match = re.search(r'version:\s*"([^"]+)"', content)
+        self.assertIsNotNone(match, "Could not find version in SKILL.md")
+        self.assertEqual(match.group(1), recall.SKILL_VERSION)
+
+
 if __name__ == "__main__":
     unittest.main()

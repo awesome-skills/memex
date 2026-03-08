@@ -9,7 +9,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from recall_common import SKIP_MARKERS, extract_text
+from recall_common import SKIP_MARKERS, extract_text, is_noise
 
 
 def iter_messages(path):
@@ -68,7 +68,7 @@ def iter_messages(path):
                     continue
 
             text = extract_text(content)
-            if not text or any(marker in text for marker in SKIP_MARKERS):
+            if not text or is_noise(text):
                 continue
 
             yield role, text
@@ -107,7 +107,11 @@ def main():
     if args.pretty:
         for role, text in iter_messages(args.path):
             print(f"--- {role} ---")
-            print(text[:500])
+            if len(text) > 500:
+                print(text[:500])
+                print(f"    ... [{len(text) - 500} chars truncated]")
+            else:
+                print(text)
             print()
     else:
         msgs = [{"role": role, "text": text} for role, text in iter_messages(args.path)]

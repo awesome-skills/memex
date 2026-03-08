@@ -1,1 +1,8 @@
-scripts/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.recall.db
+.recall.db-wal
+.recall.db-shm
+docs/plans/

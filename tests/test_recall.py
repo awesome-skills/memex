@@ -1152,6 +1152,25 @@ class TestInferProjectDash(unittest.TestCase):
             result = recall.infer_project_from_path(file_path)
             self.assertEqual(result, real_abc, "Should prefer /a/b/c over /a/b-c")
 
+    def test_ambiguous_path_inherent_limitation(self):
+        """Encoding is lossy: /a-b/c and /a/b/c both encode to a-b-c.
+
+        When both exist, shortest-match-first always picks /a/b/c.
+        This is a known limitation — cwd-based inference (the primary path)
+        avoids this entirely.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "a-b", "c"))
+            os.makedirs(os.path.join(tmpdir, "a", "b", "c"))
+            # The real path was /a-b/c, but encoding is identical to /a/b/c
+            real_ab_c = os.path.realpath(os.path.join(tmpdir, "a-b", "c"))
+            encoded = real_ab_c.lstrip("/").replace("/", "-")
+            file_path = f"/x/.claude/projects/-{encoded}/session.jsonl"
+            result = recall.infer_project_from_path(file_path)
+            # Shortest-match-first picks /a/b/c — this is the known tradeoff
+            expected = os.path.realpath(os.path.join(tmpdir, "a", "b", "c"))
+            self.assertEqual(result, expected)
+
 
 # ── Prune orphan rate-limiting ────────────────────────────────────────────
 
@@ -1194,6 +1213,15 @@ class TestPruneOrphanRateLimit(DBTestCase):
         )
         self.conn.commit()
 
+        self.assertFalse(recall._should_skip_prune(self.conn))
+
+    def test_corrupted_metadata_does_not_crash(self):
+        """Non-numeric _prune_last_run value should not raise."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('_prune_last_run', 'oops')",
+        )
+        self.conn.commit()
+        # Should return False (proceed with prune), not raise ValueError
         self.assertFalse(recall._should_skip_prune(self.conn))
 
 

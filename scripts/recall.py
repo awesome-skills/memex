@@ -373,9 +373,10 @@ def infer_project_from_path(file_path):
 
     The encoded segment uses dashes for path separators, but real directory
     names may also contain dashes (e.g. ``my-project`` encodes as ``my-project``).
-    We greedily reconstruct the path by testing longest-match directory segments
-    against the real filesystem, falling back to naive ``replace('-', '/')`` only
-    when filesystem validation is not possible.
+    This encoding is lossy: ``/a/b-c`` and ``/a-b/c`` both encode to ``a-b-c``.
+    When ambiguous, we prefer more path segments (shortest-match-first), which
+    is correct for the common case.  When ``cwd`` is present in the session
+    file itself, this fallback is not used.
     """
     match = CLAUDE_PROJECT_DIR_RE.search(file_path or "")
     if not match:
@@ -729,7 +730,7 @@ def _should_skip_prune(conn):
         ).fetchone()
         if row:
             return time.time() - float(row[0]) < _PRUNE_INTERVAL_SECONDS
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, ValueError, TypeError):
         pass
     return False
 
@@ -1506,6 +1507,11 @@ def main():
                         results.append(row)
                 results.sort(key=lambda r: r[7])
                 results = results[:args.limit]
+
+        # Post-filter: remove results whose source file has been deleted.
+        # This is O(limit) stat calls — cheap — and avoids showing stale
+        # sessions between rate-limited full prune cycles.
+        results = [r for r in results if not r[2] or os.path.exists(r[2])]
 
         if not results:
             if args.json:

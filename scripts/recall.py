@@ -59,6 +59,11 @@ def create_schema(conn):
             tokenize='porter unicode61'
         );
 
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sessions_ts
             ON sessions(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_sessions_source
@@ -95,6 +100,11 @@ def migrate_schema(conn):
             conn.execute(idx_sql)
         except sqlite3.OperationalError:
             pass
+    # Ensure metadata table exists for databases created before it was added
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    except sqlite3.OperationalError:
+        pass
 
 
 def get_db_schema_version(conn):
@@ -173,12 +183,23 @@ def migrate_db_location():
     """Move recall.db from ~/.claude/ to ~/ if it exists at the old path."""
     old_path = CLAUDE_DIR / "recall.db"
     if old_path.exists() and not DB_PATH.exists():
+        # Flush WAL into main file so only one rename is needed (avoids
+        # crash-window where main file moved but WAL/SHM are left behind).
+        try:
+            tmp_conn = sqlite3.connect(str(old_path))
+            tmp_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            tmp_conn.close()
+        except sqlite3.Error:
+            pass
         old_path.rename(DB_PATH)
-        # Also move the WAL/SHM files if they exist
+        # Clean up any residual WAL/SHM files
         for suffix in ("-wal", "-shm"):
             old_extra = Path(str(old_path) + suffix)
             if old_extra.exists():
-                old_extra.rename(Path(str(DB_PATH) + suffix))
+                try:
+                    old_extra.unlink()
+                except OSError:
+                    pass
 
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -349,14 +370,51 @@ def infer_project_from_path(file_path):
     """Infer project path from Claude session file path.
 
     e.g. ~/.claude/projects/-Users-admin-work/SESSION.jsonl -> /Users/admin/work
+
+    The encoded segment uses dashes for path separators, but real directory
+    names may also contain dashes (e.g. ``my-project`` encodes as ``my-project``).
+    We greedily reconstruct the path by testing longest-match directory segments
+    against the real filesystem, falling back to naive ``replace('-', '/')`` only
+    when filesystem validation is not possible.
     """
     match = CLAUDE_PROJECT_DIR_RE.search(file_path or "")
     if not match:
         return ""
-    encoded = match.group(1)  # e.g. "-Users-admin-work"
-    # Replace leading dash and internal dashes with /
-    inferred = "/" + encoded.lstrip("-").replace("-", "/")
+    encoded = match.group(1)  # e.g. "-Users-admin-work" or "-Users-admin-my-project"
+    parts = encoded.lstrip("-").split("-")
+    if not parts:
+        return ""
+
+    # Greedy reconstruction: try to resolve from left, preferring longer segments
+    # that correspond to real directories.
+    segments = _greedy_decode_segments(parts)
+    inferred = "/" + "/".join(segments)
     return normalize_project_path(inferred)
+
+
+def _greedy_decode_segments(parts):
+    """Decode dash-separated parts into path segments using filesystem probing.
+
+    Tries shortest match first (single part) so that ``/a/b/c`` is preferred
+    over ``/a/b-c`` when both directories exist.  Only groups consecutive
+    parts with dashes when no single-part directory is found at that level.
+    """
+    segments = []
+    i = 0
+    while i < len(parts):
+        # Try shortest match first (1 part), extending only when needed.
+        best = 0
+        for j in range(i + 1, len(parts) + 1):
+            candidate = "-".join(parts[i:j])
+            test_path = "/" + "/".join(segments + [candidate])
+            if os.path.isdir(test_path):
+                best = j - i
+                break
+        if best == 0:
+            best = 1  # no match at all — consume one part (naive fallback)
+        segments.append("-".join(parts[i:i + best]))
+        i += best
+    return segments
 
 
 def sanitize_fts_query(query):
@@ -660,18 +718,49 @@ def build_session_constraints(project=None, days=None, source=None, alias="s2", 
     return conds, params
 
 
+_PRUNE_INTERVAL_SECONDS = 3600  # rate-limit orphan pruning to once per hour
+
+
+def _should_skip_prune(conn):
+    """Return True if the last prune ran less than _PRUNE_INTERVAL_SECONDS ago."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = '_prune_last_run'"
+        ).fetchone()
+        if row:
+            return time.time() - float(row[0]) < _PRUNE_INTERVAL_SECONDS
+    except sqlite3.OperationalError:
+        pass
+    return False
+
+
+def _record_prune_timestamp(conn):
+    """Record the current time as the last prune timestamp."""
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('_prune_last_run', ?)",
+            (str(time.time()),),
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
 def prune_orphan_sessions(conn):
-    """Remove indexed sessions whose source files no longer exist."""
+    """Remove indexed sessions whose source files no longer exist.
+
+    Always performs a full scan.  Callers that want rate-limiting (e.g.
+    ``index_sessions``) should check ``_should_skip_prune`` beforehand.
+    """
     to_delete = []
     for session_id, file_path in conn.execute("SELECT session_id, file_path FROM sessions"):
         if file_path and not os.path.exists(file_path):
             to_delete.append((session_id,))
 
-    if not to_delete:
-        return 0
+    if to_delete:
+        conn.executemany("DELETE FROM sessions WHERE session_id = ?", to_delete)
+        conn.executemany("DELETE FROM messages WHERE session_id = ?", to_delete)
 
-    conn.executemany("DELETE FROM sessions WHERE session_id = ?", to_delete)
-    conn.executemany("DELETE FROM messages WHERE session_id = ?", to_delete)
+    _record_prune_timestamp(conn)
     return len(to_delete)
 
 
@@ -728,7 +817,10 @@ def _collect_files_with_dir_checkpoint(conn, base_dir, source, force=False):
 
 
 def index_sessions(conn, force=False):
-    """Scan and index new/changed session files from all sources."""
+    """Scan and index new/changed session files from all sources.
+
+    Caller must wrap this in a transaction (e.g. BEGIN IMMEDIATE) for atomicity.
+    """
     if force:
         conn.executescript("""
             DELETE FROM sessions;
@@ -737,7 +829,7 @@ def index_sessions(conn, force=False):
         """)
 
     orphaned = 0
-    if not force:
+    if not force and not _should_skip_prune(conn):
         orphaned = prune_orphan_sessions(conn)
 
     # Get existing mtimes keyed by file_path (stable across session_id changes)
@@ -869,7 +961,7 @@ def list_sessions(conn, project=None, days=None, source=None, limit=10, query=No
         print(f"List query error, falling back to LIKE: {e}", file=sys.stderr)
         return search_like_fallback(
             conn, query, project=project, days=days, source=source,
-            limit=limit, include_subagents=include_subagents,
+            limit=limit, include_subagents=include_subagents, offset=offset,
         )
 
     results = [(sid, src, fpath, proj, slug, ts, "", 0.0, summ) for sid, src, fpath, proj, slug, ts, summ in rows]
@@ -887,12 +979,13 @@ def list_sessions(conn, project=None, days=None, source=None, limit=10, query=No
             limit=limit,
             include_subagents=include_subagents,
             preserve_sql_order=True,
+            offset=offset,
         )
     return results
 
 
 def search_cjk_fallback(conn, query, project=None, days=None, source=None, limit=10,
-                        include_subagents=False, preserve_sql_order=False):
+                        include_subagents=False, preserve_sql_order=False, offset=0):
     """Fallback search for simple CJK queries using escaped substring matching."""
     terms = extract_cjk_terms(query)
     if not terms:
@@ -908,7 +1001,7 @@ def search_cjk_fallback(conn, query, project=None, days=None, source=None, limit
     if session_conds:
         session_filter = " AND " + " AND ".join(session_conds)
 
-    candidate_limit = limit * 3
+    candidate_limit = (offset + limit) * 3
     sql = f"""
         SELECT m.session_id, MAX(m.rowid) as match_rowid,
                s.source, s.file_path, s.project, s.slug, s.timestamp, s.summary
@@ -953,11 +1046,11 @@ def search_cjk_fallback(conn, query, project=None, days=None, source=None, limit
 
     if not preserve_sql_order:
         results.sort(key=lambda r: r[7])
-    return results[:limit]
+    return results[offset:offset + limit]
 
 
 def search_like_fallback(conn, query, project=None, days=None, source=None, limit=10,
-                         include_subagents=False):
+                         include_subagents=False, offset=0):
     """Fallback search using LIKE when FTS query fails (e.g. special characters)."""
     escaped = escape_like(query)
     session_conds, session_params = build_session_constraints(
@@ -976,9 +1069,9 @@ def search_like_fallback(conn, query, project=None, days=None, source=None, limi
         WHERE m.text LIKE ? ESCAPE '\\'{session_filter}
         GROUP BY m.session_id
         ORDER BY s.timestamp DESC, match_rowid DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
     """
-    params = [f"%{escaped}%"] + session_params + [limit]
+    params = [f"%{escaped}%"] + session_params + [limit, offset]
 
     try:
         matched = conn.execute(sql, params).fetchall()
@@ -1045,7 +1138,7 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
         print(f"FTS search error, falling back to LIKE: {e}", file=sys.stderr)
         return search_like_fallback(
             conn, query, project=project, days=days, source=source,
-            limit=limit, include_subagents=include_subagents,
+            limit=limit, include_subagents=include_subagents, offset=offset,
         )
 
     if not ranked:
@@ -1061,19 +1154,13 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
     ).fetchall()
     meta_map = {row[0]: row[1:] for row in meta_rows}
 
-    results = []
+    # First pass: compute blended ranks WITHOUT fetching snippets.
+    candidates = []
     now_ms = time.time() * 1000
     for session_id, rank in ranked:
         meta = meta_map.get(session_id)
         if not meta:
             continue
-
-        # Snippet still per-session (FTS5 snippet() requires MATCH context)
-        snippet_row = conn.execute(
-            "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ? AND session_id = ? LIMIT 1",
-            (safe_query, session_id),
-        ).fetchone()
-        excerpt = snippet_row[0] if snippet_row else ""
 
         # Apply recency bias: blend BM25 score with a time-decay boost.
         # BM25 rank is negative (more negative = better match).
@@ -1086,12 +1173,23 @@ def search(conn, query, project=None, days=None, source=None, limit=10, include_
         else:
             recency_boost = 0.0
         blended_rank = rank * (1 + 0.2 * recency_boost)
+        candidates.append((session_id, meta, blended_rank))
 
+    # Sort and slice BEFORE fetching snippets (reduces snippet queries to ≤ limit).
+    candidates.sort(key=lambda c: c[2])
+    page = candidates[offset:offset + limit]
+
+    # Second pass: fetch snippets only for the final result page.
+    results = []
+    for session_id, meta, blended_rank in page:
+        snippet_row = conn.execute(
+            "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ? AND session_id = ? LIMIT 1",
+            (safe_query, session_id),
+        ).fetchone()
+        excerpt = snippet_row[0] if snippet_row else ""
         results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, blended_rank, meta[5] or ""))
 
-    # Re-sort by blended rank and apply offset + limit.
-    results.sort(key=lambda r: r[7])
-    return results[offset:offset + limit]
+    return results
 
 
 def format_timestamp(ts_ms, precise=False):
@@ -1158,12 +1256,18 @@ def build_doctor_payload(conn, fix_applied=False, actions=None):
     latest_session_ts = conn.execute("SELECT MAX(timestamp) FROM sessions").fetchone()[0]
     latest_mtime = conn.execute("SELECT MAX(mtime) FROM sessions").fetchone()[0]
 
+    def _safe_size(p):
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+
     db_exists = DB_PATH.exists()
-    db_size_bytes = DB_PATH.stat().st_size if db_exists else 0
+    db_size_bytes = _safe_size(DB_PATH) if db_exists else 0
     wal_path = Path(str(DB_PATH) + "-wal")
     shm_path = Path(str(DB_PATH) + "-shm")
-    wal_size_bytes = wal_path.stat().st_size if wal_path.exists() else 0
-    shm_size_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+    wal_size_bytes = _safe_size(wal_path)
+    shm_size_bytes = _safe_size(shm_path)
 
     checks = {
         "db_exists": db_exists,
@@ -1230,7 +1334,7 @@ def apply_doctor_fixes(conn, payload):
         t0 = time.time()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=False)
+            indexed, skipped, total_sessions, total_messages, orphaned = index_sessions(conn, force=True)
             conn.commit()
             elapsed = time.time() - t0
             actions.append(
@@ -1394,6 +1498,7 @@ def main():
                     source=args.source,
                     limit=args.limit,
                     include_subagents=inc_sub,
+                    offset=args.offset,
                 )
                 existing_ids = {row[0] for row in results}
                 for row in fallback:

@@ -9,7 +9,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from recall_common import SKIP_MARKERS, extract_text, is_noise
+from recall_common import extract_text, is_noise
 
 
 def iter_messages(path):
@@ -75,12 +75,19 @@ def iter_messages(path):
 
 
 def detect_format(path):
-    """Detect whether a session file is Claude Code or Codex format."""
+    """Detect whether a session file is Claude Code or Codex format.
+
+    Only inspects the first 50 lines to avoid reading entire large files.
+    """
+    lines_checked = 0
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            lines_checked += 1
+            if lines_checked > 50:
+                break
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:

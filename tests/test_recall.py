@@ -5,6 +5,7 @@ Covers: query sanitization, project matching, CJK fallback, orphan cleanup,
 subagent filtering, slug deduplication, directory checkpointing, noise filtering.
 """
 
+import io
 import json
 import os
 import sqlite3
@@ -782,7 +783,8 @@ class TestIncrementalIndexFileUpdate(DBTestCase):
 class TestListFTSFallback(DBTestCase):
     """--list with query should fall back to LIKE when FTS fails."""
 
-    def test_fts_error_falls_back_to_like(self):
+    @patch("sys.stderr", new_callable=io.StringIO)
+    def test_fts_error_falls_back_to_like(self, _mock_stderr):
         self._insert_session("s1", project="/test")
         self._insert_messages("s1", [("user", "deploy kubernetes cluster")])
 
@@ -1060,6 +1062,176 @@ class TestVersionConsistency(unittest.TestCase):
         match = re.search(r'version:\s*"([^"]+)"', content)
         self.assertIsNotNone(match, "Could not find version in SKILL.md")
         self.assertEqual(match.group(1), recall.SKILL_VERSION)
+
+
+# ── Fallback pagination ──────────────────────────────────────────────────
+
+class TestFallbackPagination(DBTestCase):
+    """Verify offset is correctly applied through fallback search paths."""
+
+    def test_like_fallback_with_offset(self):
+        for i in range(5):
+            ts = int(time.time() * 1000) - i * 86_400_000
+            self._insert_session(f"s{i}", timestamp=ts)
+            self._insert_messages(f"s{i}", [("user", f"unique-special-term item {i}")])
+
+        page1 = recall.search_like_fallback(
+            self.conn, "unique-special-term", limit=2, offset=0, include_subagents=True,
+        )
+        page2 = recall.search_like_fallback(
+            self.conn, "unique-special-term", limit=2, offset=2, include_subagents=True,
+        )
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        ids1 = {r[0] for r in page1}
+        ids2 = {r[0] for r in page2}
+        self.assertEqual(len(ids1 & ids2), 0, "Pages should not overlap")
+
+    def test_cjk_fallback_with_offset(self):
+        for i in range(5):
+            ts = int(time.time() * 1000) - i * 86_400_000
+            self._insert_session(f"s{i}", timestamp=ts)
+            self._insert_messages(f"s{i}", [("user", f"讨论数据库迁移策略 第{i}次")])
+
+        page1 = recall.search_cjk_fallback(
+            self.conn, "数据库", limit=2, offset=0, include_subagents=True,
+        )
+        page2 = recall.search_cjk_fallback(
+            self.conn, "数据库", limit=2, offset=2, include_subagents=True,
+        )
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        ids1 = {r[0] for r in page1}
+        ids2 = {r[0] for r in page2}
+        self.assertEqual(len(ids1 & ids2), 0, "Pages should not overlap")
+
+
+# ── Project path inference with dashes ────────────────────────────────────
+
+class TestInferProjectDash(unittest.TestCase):
+    """Verify project path inference handles dashes in directory names."""
+
+    def test_project_name_with_dash(self):
+        """Dashes in the last path segment should be preserved when the dir exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = os.path.join(tmpdir, "my-project")
+            os.makedirs(project_dir)
+            real_project = os.path.realpath(project_dir)
+            encoded = real_project.lstrip("/").replace("/", "-")
+            file_path = f"/x/.claude/projects/-{encoded}/session.jsonl"
+            result = recall.infer_project_from_path(file_path)
+            self.assertEqual(result, real_project)
+
+    def test_naive_fallback_when_path_absent(self):
+        """When no directories exist to validate, fall back to naive slash decode."""
+        path = "/Users/test/.claude/projects/-Users-test-myproject/session.jsonl"
+        # Should still produce /Users/test/myproject (same as before)
+        self.assertEqual(recall.infer_project_from_path(path), "/Users/test/myproject")
+
+    def test_multiple_dashed_segments(self):
+        """Multiple directory levels with dashes should all be preserved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = os.path.join(tmpdir, "my-org", "my-project")
+            os.makedirs(nested)
+            real_path = os.path.realpath(nested)
+            encoded = real_path.lstrip("/").replace("/", "-")
+            file_path = f"/x/.claude/projects/-{encoded}/session.jsonl"
+            result = recall.infer_project_from_path(file_path)
+            self.assertEqual(result, real_path)
+
+    def test_ambiguous_path_prefers_more_segments(self):
+        """When both /a/b-c and /a/b/c exist, prefer /a/b/c (more segments)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create both ambiguous paths
+            os.makedirs(os.path.join(tmpdir, "a", "b-c"))
+            os.makedirs(os.path.join(tmpdir, "a", "b", "c"))
+            real_abc = os.path.realpath(os.path.join(tmpdir, "a", "b", "c"))
+            # Both paths produce the same encoding: tmpdir-a-b-c
+            encoded = real_abc.lstrip("/").replace("/", "-")
+            file_path = f"/x/.claude/projects/-{encoded}/session.jsonl"
+            result = recall.infer_project_from_path(file_path)
+            self.assertEqual(result, real_abc, "Should prefer /a/b/c over /a/b-c")
+
+
+# ── Prune orphan rate-limiting ────────────────────────────────────────────
+
+class TestPruneOrphanRateLimit(DBTestCase):
+    """Orphan pruning rate-limiting in index_sessions, direct prune always works."""
+
+    def test_direct_prune_always_works(self):
+        """prune_orphan_sessions always scans regardless of rate-limit state."""
+        # First call — records timestamp
+        recall.prune_orphan_sessions(self.conn)
+
+        # Insert an orphan immediately after
+        self.conn.execute(
+            "INSERT INTO sessions (session_id, file_path, source, timestamp) VALUES (?, ?, ?, ?)",
+            ("orphan1", "/nonexistent/file.jsonl", "claude", 1000),
+        )
+        self.conn.commit()
+
+        # Direct prune should always remove orphans (no rate-limiting)
+        result = recall.prune_orphan_sessions(self.conn)
+        self.assertEqual(result, 1)
+        count = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_index_sessions_skips_prune_within_interval(self):
+        """index_sessions rate-limits prune via _should_skip_prune."""
+        # Record a recent prune timestamp
+        recall._record_prune_timestamp(self.conn)
+        self.conn.commit()
+
+        # _should_skip_prune should return True
+        self.assertTrue(recall._should_skip_prune(self.conn))
+
+    def test_index_sessions_allows_prune_after_interval(self):
+        """_should_skip_prune returns False after interval expires."""
+        past = time.time() - recall._PRUNE_INTERVAL_SECONDS - 1
+        self.conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('_prune_last_run', ?)",
+            (str(past),),
+        )
+        self.conn.commit()
+
+        self.assertFalse(recall._should_skip_prune(self.conn))
+
+
+# ── Doctor --fix with stale checkpoints ───────────────────────────────────
+
+class TestDoctorFixForceReindex(DBTestCase):
+    """doctor --fix should force-rebuild even when dir checkpoints exist."""
+
+    def test_fix_clears_checkpoints_on_empty_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_dir = Path(tmpdir)
+            codex_dir = Path("/nonexistent")
+
+            session_path = os.path.join(tmpdir, "session.jsonl")
+            with open(session_path, "w") as f:
+                f.write(json.dumps({
+                    "type": "user", "role": "user",
+                    "cwd": "/tmp/demo",
+                    "message": {"content": "hello"},
+                    "timestamp": "2026-03-05T10:00:00Z",
+                }) + "\n")
+
+            # Plant a stale checkpoint — would cause incremental index to skip
+            self.conn.execute(
+                "INSERT INTO dir_checkpoints (dir_path, mtime) VALUES (?, ?)",
+                (tmpdir, os.path.getmtime(tmpdir)),
+            )
+            self.conn.commit()
+
+            with patch.object(recall, "CLAUDE_PROJECTS_DIR", claude_dir), \
+                 patch.object(recall, "CODEX_SESSIONS_DIR", codex_dir):
+                payload = recall.build_doctor_payload(self.conn)
+                actions = recall.apply_doctor_fixes(self.conn, payload)
+                refreshed = recall.build_doctor_payload(
+                    self.conn, fix_applied=True, actions=actions,
+                )
+
+            self.assertGreaterEqual(refreshed["index"]["total_sessions"], 1)
 
 
 if __name__ == "__main__":

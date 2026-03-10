@@ -33,7 +33,9 @@ CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 
 
 def create_schema(conn):
-    conn.executescript("""
+    # Use individual execute() calls (not executescript) so the caller's
+    # transaction context is preserved if one exists.
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
             source TEXT,
@@ -45,32 +47,37 @@ def create_schema(conn):
             summary TEXT DEFAULT '',
             is_subagent INTEGER DEFAULT 0,
             parent_session_id TEXT DEFAULT ''
-        );
-
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS dir_checkpoints (
             dir_path TEXT PRIMARY KEY,
             mtime REAL
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
-            session_id UNINDEXED,
-            role,
-            text,
-            tokenize='porter unicode61'
-        );
-
+        )
+    """)
+    # FTS5 virtual tables cannot use IF NOT EXISTS with execute() in all
+    # SQLite builds; guard with a table-existence check instead.
+    existing = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "messages" not in existing:
+        conn.execute("""
+            CREATE VIRTUAL TABLE messages USING fts5(
+                session_id UNINDEXED,
+                role,
+                text,
+                tokenize='porter unicode61'
+            )
+        """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_sessions_ts
-            ON sessions(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_sessions_source
-            ON sessions(source);
-        CREATE INDEX IF NOT EXISTS idx_sessions_subagent
-            ON sessions(is_subagent);
+        )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_subagent ON sessions(is_subagent)")
 
 
 def migrate_schema(conn):
@@ -823,11 +830,12 @@ def index_sessions(conn, force=False):
     Caller must wrap this in a transaction (e.g. BEGIN IMMEDIATE) for atomicity.
     """
     if force:
-        conn.executescript("""
-            DELETE FROM sessions;
-            DELETE FROM messages;
-            DELETE FROM dir_checkpoints;
-        """)
+        # Use individual execute() calls instead of executescript() to
+        # preserve the caller's BEGIN IMMEDIATE transaction.  executescript()
+        # implicitly commits any pending transaction, breaking atomicity.
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM dir_checkpoints")
 
     orphaned = 0
     if not force and not _should_skip_prune(conn):
@@ -1413,6 +1421,10 @@ def main():
     parser.add_argument("--fix", action="store_true", help="Apply safe auto-fixes (requires --doctor)")
 
     args = parser.parse_args()
+    if args.limit <= 0:
+        parser.error("--limit must be > 0")
+    if args.offset < 0:
+        parser.error("--offset must be >= 0")
     if args.summary_len <= 0:
         parser.error("--summary-len must be > 0")
     if args.fix and not args.doctor:
@@ -1490,6 +1502,8 @@ def main():
             )
 
             # For simple Chinese queries, augment sparse FTS results with substring fallback.
+            # Use offset=0 here because search() already applied the user's offset;
+            # this path only fills gaps in the current page with additional matches.
             if contains_cjk(args.query) and is_simple_query(args.query) and len(results) < args.limit:
                 fallback = search_cjk_fallback(
                     conn,
@@ -1499,7 +1513,6 @@ def main():
                     source=args.source,
                     limit=args.limit,
                     include_subagents=inc_sub,
-                    offset=args.offset,
                 )
                 existing_ids = {row[0] for row in results}
                 for row in fallback:

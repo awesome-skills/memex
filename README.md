@@ -299,6 +299,6 @@ Found a bug or have an idea? / 发现 bug 或有新想法？
 
 Release process: see [RELEASE.md](RELEASE.md)
 
-Forked from [arjunkmrm/recall](https://github.com/arjunkmrm/recall) · [MIT License](LICENSE)
+[MIT License](LICENSE)
 
 </div>

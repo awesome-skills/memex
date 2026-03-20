@@ -775,8 +775,9 @@ def build_session_constraints(project=None, days=None, source=None, alias="s2",
                 )
                 params.extend([excl_norm, like_prefix + "/%"])
             else:
-                # excl normalised to "" (e.g. input was "/") → exclude sessions with no project
-                conds.append(f"{alias}.project != ''")
+                # excl normalised to "" (e.g. input was "/") → exclude sessions with no project.
+                # Also exclude legacy rows where project was stored as "/" before the normalisation fix.
+                conds.append(f"({alias}.project != '' AND {alias}.project != '/')")
     if days:
         cutoff = int((time.time() - days * 86400) * 1000)
         conds.append(f"{alias}.timestamp >= ?")

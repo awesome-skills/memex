@@ -2,7 +2,7 @@
 name: memex
 description: >
   Search past Claude Code and Codex sessions. Triggers: /memex, "search old conversations",
-  "find a past session", "memex a previous conversation", "search session history",
+  "find a past session", "recall a previous conversation", "search session history",
   "what did we discuss", "remember when we"
 metadata:
   author: awesome-skills

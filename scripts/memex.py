@@ -211,7 +211,7 @@ def migrate_db_location():
       2. ~/.recall.db         (intermediate name before rename to memex)
     """
     # Prefer the more recent intermediate path; fall back to the original.
-    legacy_recall = Path.home() / "recall.db"  # the old ~/.recall.db intermediate
+    legacy_recall = Path.home() / ".recall.db"  # the old ~/.recall.db intermediate
     old_path = legacy_recall if legacy_recall.exists() else CLAUDE_DIR / "recall.db"
     if old_path.exists() and not DB_PATH.exists():
         # Flush WAL into main file so only one rename is needed (avoids
@@ -782,8 +782,9 @@ def build_session_constraints(project=None, days=None, source=None, alias="s2",
                 )
                 params.extend([excl_norm, like_prefix + "/%"])
             else:
-                # excl normalised to "" (e.g. input was "/") → exclude sessions with no project
-                conds.append(f"{alias}.project != ''")
+                # excl normalised to "" (e.g. input was "/") → exclude sessions with no project.
+                # Also exclude legacy rows where project was stored as "/" before the normalisation fix.
+                conds.append(f"({alias}.project != '' AND {alias}.project != '/')")
     if days:
         cutoff = int((time.time() - days * 86400) * 1000)
         conds.append(f"{alias}.timestamp >= ?")

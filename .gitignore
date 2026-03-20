@@ -6,3 +6,4 @@ __pycache__/
 .memex.db-wal
 .memex.db-shm
 docs/plans/
+.golutra/

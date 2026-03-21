@@ -1,19 +1,26 @@
 <div align="center">
 
-# Memex
+<img src="https://img.shields.io/badge/Memex-Search%20Your%20AI%20Conversations-8A2BE2?style=for-the-badge&logo=searchengin&logoColor=white" alt="Memex" />
 
-**Your AI conversations, instantly searchable.**
+<br><br>
 
-A local full-text search engine for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://openai.com/index/codex/) session history.
+<strong>Your AI conversations, instantly searchable.</strong>
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)]()
+<p>A local full-text search engine for <img src="https://img.shields.io/badge/Claude%20Code-D97706?logo=anthropic&logoColor=white" alt="Claude Code" valign="middle" /> and <img src="https://img.shields.io/badge/Codex-412991?logo=openai&logoColor=white" alt="Codex" valign="middle" /> session history.</p>
+
+<br>
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-119%20passed-success?style=flat-square&logo=githubactions&logoColor=white)](https://github.com/awesome-skills/memex/actions)
 [![CI](https://github.com/awesome-skills/memex/actions/workflows/tests.yml/badge.svg)](https://github.com/awesome-skills/memex/actions)
 
 [English](#english) · [中文](#中文)
 
 </div>
+
+<br>
 
 ---
 
@@ -21,19 +28,21 @@ A local full-text search engine for [Claude Code](https://docs.anthropic.com/en/
 
 ## Why Memex?
 
-You've had hundreds of conversations with Claude Code and Codex. Somewhere in that history is the exact discussion about that database migration, that tricky regex, or that architecture decision — but good luck finding it by scrolling through files.
+You've had hundreds of conversations with <img src="https://img.shields.io/badge/Claude%20Code-D97706?logo=anthropic&logoColor=white" alt="Claude Code" valign="middle" /> and <img src="https://img.shields.io/badge/Codex-412991?logo=openai&logoColor=white" alt="Codex" valign="middle" />. Somewhere in that history is the exact discussion about that database migration, that tricky regex, or that architecture decision — but good luck finding it by scrolling through files.
 
 Memex builds a local search index over all your past sessions. Find any conversation in seconds, then resume it right where you left off.
 
 ### Features
 
-- **Full-text search** — BM25 ranking with FTS5, stemming, phrase/boolean/prefix queries
-- **Smart ranking** — Blends relevance (80%) with recency (20%, 30-day half-life)
-- **Incremental indexing** — Two-level mtime checkpointing; milliseconds on subsequent runs
-- **CJK support** — Automatic substring fallback for Chinese, Japanese, and Korean queries
-- **Session summaries** — First meaningful message stored per session for quick scanning
-- **Resume anywhere** — Each result includes a ready-to-run resume command
-- **Zero dependencies** — Pure Python 3.9+ stdlib, single SQLite file
+| | Feature | Description |
+|:--|:--------|:------------|
+| :mag: | **Full-text search** | BM25 ranking with FTS5, stemming, phrase/boolean/prefix queries |
+| :chart_with_upwards_trend: | **Smart ranking** | Blends relevance (80%) with recency (20%, 30-day half-life) |
+| :zap: | **Incremental indexing** | Two-level mtime checkpointing; milliseconds on subsequent runs |
+| :earth_asia: | **CJK support** | Automatic substring fallback for Chinese, Japanese, and Korean queries |
+| :bookmark: | **Session summaries** | First meaningful message stored per session for quick scanning |
+| :arrow_forward: | **Resume anywhere** | Each result includes a ready-to-run resume command |
+| :package: | **Zero dependencies** | Pure Python 3.9+ stdlib, single SQLite file |
 
 ### Install
 
@@ -152,7 +161,7 @@ Query ──▶ FTS5 MATCH ──▶ BM25 rank ──▶ recency boost ──▶
 | **Subagents** | Indexed with parent session ID; hidden by default |
 | **Dependencies** | Zero — Python 3.9+ stdlib only |
 | **Migration** | Auto-migrates from legacy `~/.claude/recall.db` and `~/.recall.db` |
-| **Tests** | 40+ test classes, regression suite + GitHub Actions CI |
+| **Tests** | 119 tests across 40+ test classes + GitHub Actions CI |
 
 ---
 
@@ -162,19 +171,21 @@ Query ──▶ FTS5 MATCH ──▶ BM25 rank ──▶ recency boost ──▶
 
 ### 为什么选择 Memex？
 
-你和 Claude Code、Codex 有过无数次对话。那次关于数据库迁移的讨论、那个棘手的正则、那个架构决策——都埋在历史记录的某个角落。
+你和 <img src="https://img.shields.io/badge/Claude%20Code-D97706?logo=anthropic&logoColor=white" alt="Claude Code" valign="middle" />、<img src="https://img.shields.io/badge/Codex-412991?logo=openai&logoColor=white" alt="Codex" valign="middle" /> 有过无数次对话。那次关于数据库迁移的讨论、那个棘手的正则、那个架构决策——都埋在历史记录的某个角落。
 
 Memex 为所有历史会话建立本地全文搜索索引，几秒内找到任何对话，然后直接恢复继续。
 
 ### 特性
 
-- **全文搜索** — 基于 FTS5 的 BM25 排序，支持词干匹配、短语/布尔/前缀查询
-- **智能排序** — 融合相关性（80%）与时间衰减（20%，30 天半衰期）
-- **增量索引** — 两级 mtime 检查点，后续运行毫秒级完成
-- **中日韩支持** — 自动回退子串匹配，优化 CJK 查询召回率
-- **会话摘要** — 每个会话存储首条有意义的用户消息，快速浏览
-- **一键恢复** — 每条结果附带可直接执行的恢复命令
-- **零依赖** — 纯 Python 3.9+ 标准库，单个 SQLite 文件
+| | 特性 | 说明 |
+|:--|:-----|:-----|
+| :mag: | **全文搜索** | 基于 FTS5 的 BM25 排序，支持词干匹配、短语/布尔/前缀查询 |
+| :chart_with_upwards_trend: | **智能排序** | 融合相关性（80%）与时间衰减（20%，30 天半衰期） |
+| :zap: | **增量索引** | 两级 mtime 检查点，后续运行毫秒级完成 |
+| :earth_asia: | **中日韩支持** | 自动回退子串匹配，优化 CJK 查询召回率 |
+| :bookmark: | **会话摘要** | 每个会话存储首条有意义的用户消息，快速浏览 |
+| :arrow_forward: | **一键恢复** | 每条结果附带可直接执行的恢复命令 |
+| :package: | **零依赖** | 纯 Python 3.9+ 标准库，单个 SQLite 文件 |
 
 ### 安装
 

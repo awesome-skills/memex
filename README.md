@@ -46,9 +46,44 @@ Memex builds a local search index over all your past sessions. Find any conversa
 
 ### Install
 
-Provide this repository URL to your agent — the skill installs automatically. Then use `/memex` or ask naturally:
+#### Option 1 — Ask your agent (recommended)
+
+Just paste this into Claude Code or Codex:
+
+> Install the memex skill from https://github.com/awesome-skills/memex
+
+Done — the agent clones the repo and registers it automatically. Then use `/memex` or ask naturally:
 
 > *"find the session where we discussed WebSocket reconnection"*
+
+#### Option 2 — One-line install
+
+**macOS / Linux**
+```bash
+git clone https://github.com/awesome-skills/memex.git ~/.claude/skills/memex
+```
+
+**Windows (PowerShell)**
+```powershell
+git clone https://github.com/awesome-skills/memex.git "$env:USERPROFILE\.claude\skills\memex"
+```
+
+#### Option 3 — Standalone CLI
+
+Clone anywhere and run the scripts directly — no skill registration needed:
+
+```bash
+git clone https://github.com/awesome-skills/memex.git
+cd memex
+
+# macOS / Linux
+python3 scripts/recall.py --list
+
+# Windows
+python scripts/recall.py --list
+```
+
+> **Note:** On Windows, use `python` instead of `python3`. Requires Python 3.9+.
 
 ### Quick start
 
@@ -189,9 +224,44 @@ Memex 为所有历史会话建立本地全文搜索索引，几秒内找到任�
 
 ### 安装
 
-把本仓库地址提供给 agent 即可自动安装，随后使用 `/memex` 或自然语言提问：
+#### 方式一 — 让 agent 帮你装（推荐）
+
+在 Claude Code 或 Codex 里直接说：
+
+> 安装 memex skill：https://github.com/awesome-skills/memex
+
+agent 会自动 clone 并注册，之后用 `/memex` 或自然语言提问：
 
 > *"找一下之前讨论 WebSocket 重连的会话"*
+
+#### 方式二 — 一行命令
+
+**macOS / Linux**
+```bash
+git clone https://github.com/awesome-skills/memex.git ~/.claude/skills/memex
+```
+
+**Windows (PowerShell)**
+```powershell
+git clone https://github.com/awesome-skills/memex.git "$env:USERPROFILE\.claude\skills\memex"
+```
+
+#### 方式三 — 独立 CLI 使用
+
+Clone 到任意目录直接运行，无需注册 skill：
+
+```bash
+git clone https://github.com/awesome-skills/memex.git
+cd memex
+
+# macOS / Linux
+python3 scripts/recall.py --list
+
+# Windows
+python scripts/recall.py --list
+```
+
+> **注意：** Windows 下用 `python` 而非 `python3`，需要 Python 3.9+。
 
 ### 快速上手
 
